@@ -28,11 +28,21 @@ create table if not exists sessions (
 """
 
 
+# columns added after v0; connect() adds them to existing ledgers
+EXTRA_COLUMNS = {"track_path": "text", "note": "text", "failure": "text", "error": "text", "timeout_s": "real",
+                 "submitted": "real", "extra_paths": "text"}
+
+
 def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(path)
+    db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
+    have = {r["name"] for r in db.execute("pragma table_info(runs)")}
+    for col, typ in EXTRA_COLUMNS.items():
+        if col not in have:
+            db.execute(f"alter table runs add column {col} {typ}")
+    db.commit()
     return db
 
 
@@ -112,9 +122,50 @@ def headline(metrics: dict) -> str:
     return " · ".join(parts)
 
 
+TERMINAL = ("done", "failed", "lost", "cancelled", "missing")
+IN_FLIGHT_S = 3 * 3600
+
+
 def cached(db: sqlite3.Connection, key: str):
+    """A finished run of the same inputs (lost/cancelled runs don't count: they measured nothing)."""
     return db.execute("select * from runs where key=? and status in ('done','failed') and cached_from is null "
                       "order by ended desc limit 1", (key,)).fetchone()
+
+
+def in_flight(db: sqlite3.Connection, key: str):
+    """The same inputs already queued/running (e.g. two agents submitting one candidate): wait on it instead."""
+    return db.execute("select * from runs where key=? and status in ('queued','running') and submitted > ? "
+                      "order by submitted desc limit 1", (key, time.time() - IN_FLIGHT_S)).fetchone()
+
+
+def get(db: sqlite3.Connection, run_id: str):
+    return db.execute("select * from runs where id=?", (run_id,)).fetchone()
+
+
+def update(db: sqlite3.Connection, run_id: str, **fields) -> None:
+    if "metrics" in fields:
+        fields["metrics"] = json.dumps(fields["metrics"])
+    db.execute(f"update runs set {', '.join(f'{k}=?' for k in fields)} where id=?", (*fields.values(), run_id))
+    db.commit()
+
+
+def best_score(metrics: dict) -> float | None:
+    vals = list((metrics.get("score") or {}).values())
+    vals += [s["ratio_vs_s0"] for s in (metrics.get("sides") or {}).values() if s.get("ratio_vs_s0")]
+    return max(vals) if vals else None
+
+
+def track_best(db: sqlite3.Connection, track: str, exclude_id: str = "") -> float | None:
+    best = None
+    for r in db.execute("select id, metrics from runs where track=? and status='done' and cached_from is null "
+                        "and id != ?", (track, exclude_id)):
+        m = json.loads(r["metrics"] or "{}")
+        if m.get("checks", "PASS") != "PASS":
+            continue
+        b = best_score(m)
+        if b is not None and (best is None or b > best):
+            best = b
+    return best
 
 
 def record(db: sqlite3.Connection, **row) -> None:
@@ -126,11 +177,16 @@ def record(db: sqlite3.Connection, **row) -> None:
 
 
 def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_per_hr: float) -> None:
-    """Upsert the current pod session (start ≈ now − uptime, bucketed so jitter maps to one row)."""
-    start = round((time.time() - uptime_s) / 60) * 60
-    db.execute("insert into sessions values (?,?,?,?) on conflict(pod_id, start) do update set "
-               "uptime_s=max(uptime_s, excluded.uptime_s), cost_per_hr=excluded.cost_per_hr",
-               (pod_id, start, uptime_s, cost_per_hr))
+    """Upsert the current pod session. start ≈ now − uptime jitters by a few seconds between polls, so match any
+    session of this pod that started within 2 minutes instead of keying on an exact start."""
+    start = time.time() - uptime_s
+    row = db.execute("select start from sessions where pod_id=? and abs(start - ?) < 120 order by abs(start - ?) "
+                     "limit 1", (pod_id, start, start)).fetchone()
+    if row:
+        db.execute("update sessions set uptime_s=max(uptime_s, ?), cost_per_hr=? where pod_id=? and start=?",
+                   (uptime_s, cost_per_hr, pod_id, row["start"]))
+    else:
+        db.execute("insert into sessions values (?,?,?,?)", (pod_id, start, uptime_s, cost_per_hr))
     db.commit()
 
 
@@ -142,6 +198,46 @@ def spend(db: sqlite3.Connection, since: float = 0.0) -> float:
         if end > since:
             total += (end - max(start, since)) / 3600 * s["cost_per_hr"]
     return total
+
+
+def _union(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    out: list[list[float]] = []
+    for a, b in sorted(i for i in intervals if i[1] > i[0]):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
+def _overlap(xs: list[tuple[float, float]], ys: list[tuple[float, float]]) -> float:
+    return sum(max(0.0, min(b, d) - max(a, c)) for a, b in xs for c, d in ys)
+
+
+def utilization(db: sqlite3.Connection, since: float = 0.0) -> dict:
+    """Where the paid pod time went: GPU-locked jobs, CPU-only jobs, and idle (boot, agents thinking, reaper wait)."""
+    now = time.time()
+    sessions, paid_cost = [], 0.0
+    for s in db.execute("select * from sessions"):
+        a, b = max(s["start"], since), min(s["start"] + s["uptime_s"], now)
+        if b > a:
+            sessions.append((a, b, s["cost_per_hr"]))
+            paid_cost += (b - a) / 3600 * s["cost_per_hr"]
+    spans = _union([(a, b) for a, b, _ in sessions])
+    rows = db.execute("select mode, started, ended from runs where backend='runpod' and started is not null "
+                      "and ended is not null and ended > ?", (since,)).fetchall()
+    gpu = _union([(r["started"], r["ended"]) for r in rows if r["mode"] == "gpu"])
+    busy = _union([(r["started"], r["ended"]) for r in rows])
+    paid_s = sum(b - a for a, b in spans)
+    gpu_s, busy_s = _overlap(gpu, spans), _overlap(busy, spans)
+    rate = paid_cost / (paid_s / 3600) if paid_s else 0.0
+    return {"paid_s": paid_s, "paid_usd": paid_cost, "gpu_busy_s": gpu_s, "any_busy_s": busy_s,
+            "gpu_busy_frac": gpu_s / paid_s if paid_s else 0.0, "idle_usd": (paid_s - busy_s) / 3600 * rate}
+
+
+def agent_spend(db: sqlite3.Connection, since: float = 0.0) -> dict[str, float]:
+    return {r["agent"]: r["c"] or 0.0 for r in db.execute(
+        "select agent, sum(cost_usd) c from runs where ended > ? group by agent order by c desc", (since,))}
 
 
 def today_start() -> float:

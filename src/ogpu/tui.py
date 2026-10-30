@@ -149,15 +149,18 @@ def render(cfg: Config, tel: Telemetry, poll: Poller, width: int) -> Group:
 
     # recent results (from the local ledger, so they carry parsed metrics)
     with ledger.connect() as db:
-        recent = db.execute("select * from runs order by ended desc limit 5").fetchall()
+        recent = db.execute("select * from runs where status not in ('queued','running') "
+                            "order by ended desc limit 5").fetchall()
     rt = Table.grid(padding=(0, 2))
     rt.add_column(style="bold", width=6)
     rt.add_column()
     for i, r in enumerate(recent):
         mark = Text("⚡", style="yellow") if r["cached_from"] else (
-            Text("✔", style="bold green") if r["status"] == "done" else Text("✘", style="bold red"))
+            Text("✔", style="bold green") if r["status"] == "done" and not r["failure"] else Text("✘", style="bold red"))
         line = Text() + mark + Text(" ") + agent_text(r["agent"], r["track"])
         hl = ledger.headline(json.loads(r["metrics"] or "{}"))
+        if r["failure"] and not r["cached_from"]:
+            hl = f"{r['failure']}  {hl}".strip()
         if hl:
             line += Text(f"  {hl}", style="bold")
         line += Text(f"  {fmt_dur(r['wall_s'] or 0)} · ${r['cost_usd'] or 0:.2f} · {fmt_dur(now - (r['ended'] or now))} ago",
@@ -165,6 +168,20 @@ def render(cfg: Config, tel: Telemetry, poll: Poller, width: int) -> Group:
         rt.add_row("RECENT" if i == 0 else "", line)
     if recent:
         rows.append(rt)
+        rows.append(Text(""))
+
+    # where today's money went
+    with ledger.connect() as db:
+        u = ledger.utilization(db, ledger.today_start())
+        per_agent = ledger.agent_spend(db, ledger.today_start())
+    if u["paid_s"]:
+        frac = u["gpu_busy_frac"]
+        fs = "bold green" if frac >= 0.6 else "bold yellow" if frac >= 0.3 else "bold red"
+        line = Text() + Text("TODAY   ", style="bold") + Text("GPU busy ", style="grey70") + Text(f"{frac:.0%}", style=fs)
+        line += Text(" of paid time · idle ", style="grey70") + Text(f"${u['idle_usd']:.2f}", style="bold yellow")
+        for a, c in list(per_agent.items())[:4]:
+            line += Text("  ") + agent_text(a) + Text(f" ${c:.2f}", style="grey70")
+        rows.append(line)
         rows.append(Text(""))
 
     # idle-stop countdown + keys

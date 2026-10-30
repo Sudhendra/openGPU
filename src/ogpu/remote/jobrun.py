@@ -124,6 +124,25 @@ def prune_runs():
             subprocess.run(["rm", "-rf", p])
 
 
+def wait_with_timeout(p, timeout_s, log):
+    """Exit 124 on timeout like coreutils `timeout`: SIGTERM the job's process group, SIGKILL 30s later."""
+    try:
+        return p.wait(timeout=float(timeout_s) if timeout_s else None)
+    except subprocess.TimeoutExpired:
+        log.write(f"\nogpu: timed out after {timeout_s}s\n".encode())
+        for sig, grace in ((signal.SIGTERM, 30), (signal.SIGKILL, 5)):
+            try:
+                os.killpg(p.pid, sig)
+            except OSError:
+                pass
+            try:
+                p.wait(timeout=grace)
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        return 124
+
+
 def cmd_exec(jid):
     job = read_job(jid)
     job["runner_pid"] = os.getpid()
@@ -140,11 +159,15 @@ def cmd_exec(jid):
     touch()
     shell = f"[ -f {OG}/env.sh ] && source {OG}/env.sh; cd {json.dumps(job['cwd'])} && {job['cmd']}"
     with open(jpath(jid, "log"), "ab", buffering=0) as log:
-        p = subprocess.Popen(["bash", "-c", shell], stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                             start_new_session=True)
-        job["pid"] = p.pid
-        write_job(job)
-        rc = p.wait()
+        try:
+            p = subprocess.Popen(["bash", "-c", shell], stdout=log, stderr=subprocess.STDOUT,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+            job["pid"] = p.pid
+            write_job(job)
+            rc = wait_with_timeout(p, job.get("timeout_s"), log)
+        except OSError as e:
+            log.write(f"ogpu: could not start job: {e}\n".encode())
+            rc = 127
     job.update(status="done" if rc == 0 else "failed", ended=time.time(), exit_code=rc)
     write_job(job)
     if lockf:

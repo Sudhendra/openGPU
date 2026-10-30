@@ -22,42 +22,51 @@ Run from the track directory (or pass `--track DIR`). Everything after `--` is t
 ogpu run --cpu --json -- python3 harness/ptxas_check.py candidates/c12.py
 
 # timing + correctness: exclusive H200 lock (you may queue behind other agents; just wait)
-ogpu run --gpu --json -- python3 pod/bench.py submission_best.py submission_new.py --check --reps 20
+ogpu run --gpu --json -m "split-K=4 for d8 shapes" -- python3 pod/bench.py submission_best.py submission_new.py --check --reps 20
 
-# command imports a sibling dir? sync it too (repeatable)
-ogpu run --gpu --json --with ../tools -- python3 pod/bench.py submission_new.py --check
+# command imports a sibling dir? sync it too (repeatable). Cap runaway jobs with --timeout (seconds).
+ogpu run --gpu --json --with ../tools --timeout 900 -- python3 pod/bench.py submission_new.py --check
 
-# what has already been tried / what's winning: check BEFORE proposing a new candidate
-ogpu ledger --track <track_dir_name> --best --json
-ogpu ledger --track <track_dir_name> -n 30 --json
+# async: queue now, keep working, collect later (one JSON line per job as each finishes)
+ogpu submit --gpu -m "hypothesis A" -- python3 pod/bench.py submission_best.py cand_a.py cand_b.py --check   # -> {"id": ...}
+ogpu wait <id> [<id> ...]
+
+# shared memory: check BEFORE proposing a new candidate
+ogpu ledger --track <track_dir_name> --best --json      # what's winning
+ogpu ledger --track <track_dir_name> --failed --json    # what failed and why (failure type + note): don't repeat it
+ogpu show <id>                                          # one run: cmd, note, metrics, error excerpt, log tail
 
 ogpu logs <id>        # full log of a finished job
-ogpu logs <id> -f     # re-attach to a still-running job (e.g. after an interruption)
 ogpu cancel <id>      # only for your own job
 ogpu status --json    # pod state + today's spend vs the daily cap
 ```
 
+**Batch candidates.** Every benchmark invocation pays the `prepare` cost (model shapes, weights, inputs, and sometimes minutes of compiling). Compare several candidates in ONE command (`bench.py best.py a.py b.py c.py`) rather than one job each. `metrics.score` reports every file separately.
+
+**Always pass `-m/--note`** with the hypothesis. It's stored in the shared ledger so other agents (and you, after a context reset) can see what was tried.
+
 ## The result line (`--json`)
 ```json
-{"id": "1030-164825-d47177", "status": "done", "exit_code": 0, "wall_s": 212.4, "cost_usd": 0.31,
- "metrics": {"score": {"submission_new.py": 1.0831}, "checks": "PASS", "check_pass": 12, "check_fail": 0,
-             "sides": {"s1": {"ratio_vs_s0": 1.034, "ci95": [1.021, 1.047]}}},
- "log_path": "~/.ogpu/logs/1030-164825-d47177.log", "cached_from": null}
+{"id": "1030-164825-d47177", "status": "done", "failure": null, "error": null, "exit_code": 0, "wall_s": 212.4,
+ "cost_usd": 0.31, "metrics": {"score": {"submission_new.py": 1.0831}, "checks": "PASS", "check_pass": 12,
+ "check_fail": 0, "sides": {"s1": {"ratio_vs_s0": 1.034, "ci95": [1.021, 1.047]}}},
+ "note": "split-K=4 for d8 shapes", "log_path": "~/.ogpu/logs/1030-164825-d47177.log", "cached_from": null}
 ```
-- `status`: `done` (exit 0), `failed`, `cancelled`, or `lost` (the pod restarted mid-job; just re-run).
+- `failure`: `null` on a clean pass. Otherwise one of `compile_error`, `import_error`, `correctness_fail`, `oom`, `cuda_error`, `timeout`, `runtime_error`, `lost`, `cancelled`. `error` holds the relevant excerpt (last traceback or failing CHECK lines), so read it instead of the whole log.
+- `status`: `done` (exit 0), `failed`, `cancelled`, `lost` (the pod restarted mid-job; ogpu already retried once).
 - `metrics.score`: geomean speedup vs SGLang per file, from `SCORE <file>: <x>` lines. Higher is better.
-- `metrics.checks`: `PASS`/`FAIL`, from `CHECK ...` / `CHECKS:` lines. **A FAIL means the candidate is invalid, whatever its speed.**
+- `metrics.checks`: `PASS`/`FAIL`. **A FAIL means the candidate is invalid, whatever its speed.**
 - `metrics.sides`: paired-bench ratio vs the reference side (`s0`) with a 95% CI. Treat it as a real win only if the CI's lower bound is > 1.0.
 - Need a number the parser doesn't know? Print `OGPU_METRIC name=value` from your script and it appears in `metrics`.
-- `cached_from` set means this exact code + command already ran, so the result is free. Pass `--force` only to deliberately re-measure noise.
+- `cached_from` set means this exact code + command already ran, so the result is free. If another agent is already running the identical job, ogpu waits on that one instead of running it twice. Pass `--force` only to deliberately re-measure noise.
 - Files your command writes under `out/` come back to `<track>/output/ogpu/<id>/`.
-- Exit code: `ogpu` exits with the job's exit code. `2` means the daily budget cap was hit: stop and tell the human, don't retry.
+- **Exit codes:** the job's own code, `3` = the benchmark ran but correctness FAILED, `2` = daily budget cap hit (stop and tell the human, don't retry).
 
 ## Hill-climbing loop
-1. `ogpu ledger --track T --best --json`: know the current best and what's been tried.
+1. `ogpu ledger --track T --best --json` and `--failed --json`: know the current best and the dead ends.
 2. Write the hypothesis down where your track keeps experiments (e.g. `EXPERIMENTS.md`).
 3. `ogpu run --cpu --json -- <compile/ptxas gate>`. Fix compile errors and register/spill problems here, for free.
-4. `ogpu run --gpu --json -- <bench with --check>`, comparing the candidate against the current best in the same run.
+4. `ogpu run --gpu --json -m "<hypothesis>" -- <bench with --check>`, comparing the candidate(s) against the current best in the same run. Batch your variants into one invocation.
 5. Keep it only if `checks == PASS` and the win clears noise (CI lower bound > 1.0, or ≥ ~1.5% on `score`). Otherwise discard it and log why.
 6. Only then `okc check`, then `okc submit`.
 
@@ -65,6 +74,7 @@ ogpu status --json    # pod state + today's spend vs the daily cap
 - **Queued for a long time:** another agent holds the lock. Normal, so wait. Don't cancel other jobs.
 - **First run in a track is slow:** extensions compile once, then they're cached on the pod disk.
 - **"pod not reachable" / slow first call:** `ogpu` resumes or creates the pod automatically (2–5 min). Let it finish.
-- **Interrupted (Ctrl-C, tool timeout):** the job keeps running on the pod. Use `ogpu logs <id> -f`. Don't resubmit duplicates.
-- **`status: lost`:** the pod was restarted. Re-run the same command.
+- **Interrupted (Ctrl-C, tool timeout):** the job keeps running on the pod. Use `ogpu wait <id>`. Don't resubmit duplicates.
+- **Your tool call has a time limit shorter than the benchmark:** use `ogpu submit`, then `ogpu wait <id>` (re-run `wait` if it times out too; the job keeps going).
+- **`failure: lost` after the automatic retry:** the pod is unstable. Tell the human.
 - **Budget cap (exit 2) or repeated capacity errors:** stop and report to the human.

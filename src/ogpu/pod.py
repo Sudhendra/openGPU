@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import shlex
 import time
@@ -42,6 +43,11 @@ def sync_state(pod: Pod, cloud: str = "") -> State:
     return st
 
 
+def helpers_version() -> str:
+    src = resources.files("ogpu.remote")
+    return hashlib.sha256(b"".join(src.joinpath(n).read_bytes() for n in REMOTE_FILES)).hexdigest()[:16]
+
+
 def install_helpers(st: State, cfg: Config) -> None:
     """Copy jobrun/reaper to the pod, write the reaper config, and make sure exactly one reaper runs."""
     key = cfg.private_key_path
@@ -50,10 +56,13 @@ def install_helpers(st: State, cfg: Config) -> None:
     script = [f"mkdir -p {REMOTE_OGPU}/bin {REMOTE_OGPU}/jobs"]
     for name, body in files.items():
         script.append(f"cat > {REMOTE_OGPU}/bin/{name} <<'OGPU_EOF'\n{body}\nOGPU_EOF")
+    script.append(f"echo {helpers_version()} > {REMOTE_OGPU}/bin/VERSION")
     cfg_json = json.dumps({"idle_minutes": cfg.idle_minutes})
     script.append(f"echo {shlex.quote(cfg_json)} > {REMOTE_OGPU}/config.json")
     # reset the idle clock: a stale boot-time stamp would make the reaper stop the pod right after `up`
     script.append(f"date +%s > {REMOTE_OGPU}/last_activity")
+    # restart the reaper so it runs the current code (anchored so it can't match this shell's own command line)
+    script.append(f"pkill -f '^python3 {REMOTE_OGPU}/bin/reaper.py' || true; rm -f {REMOTE_OGPU}/reaper.pid")
     script.append(f"bash -c 'set -a; [ -f {REMOTE_OGPU}/env.sh ] && source {REMOTE_OGPU}/env.sh; "
                   f"nohup python3 {REMOTE_OGPU}/bin/reaper.py >> {REMOTE_OGPU}/reaper.log 2>&1 < /dev/null &' ")
     ssh.run(st, key, "\n".join(script), timeout=60)
@@ -119,10 +128,21 @@ def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minute
         time.sleep(30)
 
 
+def upgrade_helpers(st: State, cfg: Config) -> None:
+    """Push new jobrun/reaper versions after an `ogpu` update (running jobs keep the code they started with)."""
+    try:
+        remote = ssh.run(st, cfg.private_key_path, f"cat {REMOTE_OGPU}/bin/VERSION 2>/dev/null", check=False).stdout
+    except Exception:  # noqa: BLE001
+        return
+    if remote.strip() != helpers_version():
+        install_helpers(st, cfg)
+
+
 def ensure(cfg: Config, console: Console) -> State:
     """Fast path for `ogpu run`: trust state.json if SSH answers; otherwise bring the pod up (if auto_up)."""
     st = load_state()
     if ssh.reachable(st, cfg.private_key_path):
+        upgrade_helpers(st, cfg)
         return st
     if not cfg.auto_up:
         raise SystemExit("pod not reachable; run `ogpu up` (or set auto_up = true)")
