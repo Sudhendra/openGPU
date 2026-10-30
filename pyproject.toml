@@ -1,0 +1,32 @@
+[project]
+name = "ogpu"
+version = "0.1.0"
+description = "Personal H200 broker + shared bench service for GPU kernel hill-climbing with coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "psutil>=5.9",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+modal = ["modal>=0.64"]
+
+[project.scripts]
+ogpu = "ogpu.cli:app"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ogpu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
