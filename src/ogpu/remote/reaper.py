@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 
@@ -21,6 +22,7 @@ except ImportError:  # pragma: no cover
     jobrun = None
 
 TERM_GRACE_S = 20
+HEARTBEAT_LOG_S = 1800  # a periodic "alive" line, so a silent death shows up as a gap in reaper.log
 
 
 def gpu_sample():
@@ -89,6 +91,9 @@ def idle_minutes():
 
 
 def busy():
+    if jobrun is not None:  # reconcile closes records left by an earlier container (recycled pids) and dead runners
+        return any(jobrun.reconcile(j)["status"] in ("queued", "running")
+                   for j in jobrun.all_jobs() if j["status"] in ("queued", "running"))
     for n in os.listdir(f"{OG}/jobs"):
         if n.endswith(".json"):
             try:
@@ -149,41 +154,69 @@ def stop_pod():
 
 
 def single_instance():
+    """Exit if another reaper of THIS container is alive. The pidfile lives on the persistent volume, so a pid from
+    an earlier container may now belong to an unrelated process (sshd, sleep) — that must not keep us from running."""
+    boot = container_started_at()
     try:
         with open(PIDFILE) as f:
-            os.kill(int(f.read()), 0)
+            parts = f.read().split()
+        pid, pboot = int(parts[0]), float(parts[1]) if len(parts) > 1 else None
+        if pboot is not None and boot is not None and abs(pboot - boot) > 2:
+            raise ValueError("pidfile from an earlier container")
+        os.kill(pid, 0)
         sys.exit(0)  # another reaper is alive
-    except (OSError, ValueError):
+    except (OSError, ValueError, IndexError):
         pass
     with open(PIDFILE, "w") as f:
-        f.write(str(os.getpid()))
+        f.write(f"{os.getpid()} {boot or ''}")
+
+
+def on_signal(signum, _frame):
+    print(time.ctime(), f"reaper exiting on {signal.Signals(signum).name}", flush=True)
+    sys.exit(128 + signum)
+
+
+def tick(now):
+    """One pass: kill hung jobs, then stop the pod if it has been idle for too long. → seconds to sleep."""
+    limit = idle_minutes() * 60
+    try:
+        watchdog(now, gpu_sample())
+    except Exception as e:  # noqa: BLE001 — the reaper must keep running
+        print(time.ctime(), "watchdog error:", e, flush=True)
+    if busy():
+        state = {"busy": True, "idle_since": None, "stop_at": None}
+    else:
+        since = last_activity()
+        state = {"busy": False, "idle_since": since, "stop_at": since + limit}
+        if limit > 0 and now - since >= limit:
+            with open(STATE, "w") as f:
+                json.dump(state | {"stopping": True, "checked": now, "pid": os.getpid()}, f)
+            log_session_end()
+            stop_pod()
+            return 120
+    with open(STATE, "w") as f:  # `checked` doubles as the heartbeat `ogpu` checks before every job
+        json.dump(state | {"checked": now, "idle_minutes": limit / 60, "pid": os.getpid()}, f)
+    return 15
 
 
 def main():
     single_instance()
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
+    print(time.ctime(), "reaper started pid", os.getpid(), "idle_minutes", idle_minutes(), flush=True)
+    last_beat = time.time()
     while True:
-        limit = idle_minutes() * 60
         now = time.time()
         try:
-            watchdog(now, gpu_sample())
-        except Exception as e:  # noqa: BLE001 — the reaper must keep running
-            print(time.ctime(), "watchdog error:", e, flush=True)
-        if busy():
-            state = {"busy": True, "idle_since": None, "stop_at": None}
-        else:
-            since = last_activity()
-            state = {"busy": False, "idle_since": since, "stop_at": since + limit}
-            if limit > 0 and now - since >= limit:
-                state["stopping"] = True
-                with open(STATE, "w") as f:
-                    json.dump(state, f)
-                log_session_end()
-                stop_pod()
-                time.sleep(120)
-                continue
-        with open(STATE, "w") as f:
-            json.dump(state | {"checked": now, "idle_minutes": limit / 60}, f)
-        time.sleep(15)
+            delay = tick(now)
+        except Exception:  # noqa: BLE001 — log and keep going: a dead reaper means a pod that bills forever
+            print(time.ctime(), "reaper error:\n" + traceback.format_exc(), flush=True)
+            delay = 30
+        if now - last_beat >= HEARTBEAT_LOG_S:
+            print(time.ctime(), "alive", flush=True)
+            last_beat = now
+        time.sleep(delay)
 
 
 if __name__ == "__main__":

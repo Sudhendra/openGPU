@@ -24,7 +24,7 @@ GPU time is expensive. Most of the bill isn't GPU work:
 | | |
 |---|---|
 | **One-command machines** | `ogpu up` reuses, resumes or creates a GPU machine in your image, with fallback across GPU types and cloud tiers. Real SSH, no proxies. |
-| **Never pay for idle** | An on-machine reaper stops the machine after *N* idle minutes. Disks and compiled caches persist, so `ogpu up` resumes warm. |
+| **Never pay for idle** | An on-machine reaper stops the machine after *N* idle minutes. A guard process restarts it if it dies, and every `ogpu` call checks its heartbeat. Disks and compiled caches persist, so `ogpu up` resumes warm. |
 | **Safe sharing** | GPU jobs queue behind an exclusive lock, so timings never overlap. CPU jobs (compile gates) run in parallel without disturbing timings: builds are capped to the container's real CPU quota, run at lowest priority, and stay off reserved cores. Every job runs from its own code snapshot. |
 | **Never pay twice** | A content-hash cache (sources + command + image) returns identical runs instantly. Identical in-flight jobs are deduplicated across agents. |
 | **Shared ledger** | Every run's metrics, failure type, hypothesis note, cost and agent in one SQLite ledger: `ogpu ledger`, `ogpu show`. |
@@ -141,6 +141,7 @@ Environment: `RUNPOD_API_KEY` (required), `OGPU_AGENT`, `OGPU_HOME` (default `~/
 2. It pushes your project and submits the job under a per-project lock. The runner snapshots the code, takes the GPU lock and runs the job detached, so SSH drops and Ctrl-C don't kill it.
 3. The CLI polls the log, pulls back `out/`, parses metrics, classifies failures and writes the ledger.
 4. The reaper watches for idle time and stops the machine. Persistent disks keep code and caches for the next `ogpu up`.
+5. Every new or resumed machine must pass a GPU check (a real allocation through the image's own framework) before agents get it. Hosts whose driver is older than `min_cuda` are filtered out at creation, and a machine that still fails is replaced automatically.
 
 Only Python's standard library runs on the machine, so any image with `python3` works.
 

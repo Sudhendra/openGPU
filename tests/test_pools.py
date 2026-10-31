@@ -100,6 +100,8 @@ def test_resume_failure_recreates_then_deletes_stuck_pod(home, monkeypatch):
     monkeypatch.setattr(podmod, "wait_reachable",
                         lambda rp, pid, cfg, con, pool: events.append(("reachable", pid)) or config.State(pod_id=pid))
     monkeypatch.setattr(podmod, "install_helpers", lambda st, cfg: None)
+    monkeypatch.setattr(podmod, "import_pod_sessions", lambda st, cfg: None)
+    monkeypatch.setattr(podmod, "gpu_health", lambda st, cfg: (True, "OK"))
     st = podmod.up(config.Config(), Console(quiet=True))
     assert st.pod_id == "fresh"
     # the stuck pod is only deleted after the replacement is reachable
@@ -109,6 +111,39 @@ def test_resume_failure_recreates_then_deletes_stuck_pod(home, monkeypatch):
     with pytest.raises(SystemExit):
         podmod.up(config.Config(recreate_on_resume_failure=False), Console(quiet=True))
     assert events == [("resume", "stuck")]
+
+
+def test_up_replaces_pod_that_fails_gpu_check(monkeypatch):
+    """The Oct 30 H100 NVL had a CUDA 12.8 driver: every job died at torch CUDA init. `up` must never hand such a
+    pod to agents — it deletes it and lands on another host."""
+    from ogpu import pod as podmod
+    from ogpu.providers.runpod import Pod
+    mk = lambda pid, status: Pod(id=pid, name="n", status=status, cost_per_hr=3.19, gpu="H100 NVL", location="",
+                                 uptime_s=None, ssh_host="h", ssh_port=22)  # noqa: E731
+    events = []
+
+    class FakeRP:
+        def resume(self, pid):
+            events.append(("resume", pid))
+
+        def terminate(self, pid):
+            events.append(("terminate", pid))
+
+    health = iter([(False, "RuntimeError: The NVIDIA driver on your system is too old (found version 12080)"),
+                   (True, "OK NVIDIA H100 NVL torch cuda 13.0")])
+    monkeypatch.setattr(podmod, "client", lambda: FakeRP())
+    monkeypatch.setattr(podmod, "current", lambda rp, cfg, pool: mk("old-driver", "EXITED"))
+    monkeypatch.setattr(podmod, "create_with_fallback",
+                        lambda rp, cfg, con, retry, pool: events.append(("create", pool)) or mk("good", "RUNNING"))
+    monkeypatch.setattr(podmod, "wait_reachable", lambda rp, pid, cfg, con, pool: config.State(pod_id=pid))
+    monkeypatch.setattr(podmod, "install_helpers", lambda st, cfg: events.append(("install", st.pod_id)))
+    monkeypatch.setattr(podmod, "import_pod_sessions", lambda st, cfg: None)
+    monkeypatch.setattr(podmod, "gpu_health", lambda st, cfg: next(health))
+    monkeypatch.setattr(podmod, "save_state", lambda st, pool: None)
+    st = podmod.up(config.Config().pool("correctness"), Console(quiet=True), pool="correctness")
+    assert st.pod_id == "good"
+    assert events == [("resume", "old-driver"), ("terminate", "old-driver"), ("create", "correctness"),
+                      ("install", "good")]
 
 
 def test_check_margin_parsed_from_judge_lines():

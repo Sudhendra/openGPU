@@ -38,6 +38,7 @@ default_timeout_s = 3600               # jobs without --timeout are killed after
 hang_factor = 5                        # hang = running > factor × this command's usual (p90) runtime, log quiet
 hang_floor_s = 180                     # ...but never flag a job as hung before this many seconds
 spin_silent_s = 900                    # GPU at ~100% util on low power with a silent log this long = deadlock
+min_cuda = "13.0"                      # only hosts whose driver supports this CUDA (the image's torch is cu130)
 
 # Pools: the settings above are the `timing` pool. Other pools override any of them.
 [pools.correctness]                    # `--fidelity correctness` jobs: cheap GPUs with the same ISA (sm_90a, like H200)
@@ -47,6 +48,7 @@ idle_minutes = 10
 """
 
 POOLS = ("timing", "correctness")
+CUDA_VERSIONS = ["12.4", "12.5", "12.6", "12.7", "12.8", "12.9", "13.0", "13.1", "13.2", "13.3"]
 DEFAULT_POOLS = {"correctness": {"gpu_type_ids": ["NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
                                  "idle_minutes": 10}}
 
@@ -73,6 +75,7 @@ class Config:
     hang_factor: float = 5
     hang_floor_s: float = 180
     spin_silent_s: float = 900
+    min_cuda: str = "13.0"
     pools: dict = field(default_factory=dict)
 
     def pool(self, name: str) -> "Config | None":
@@ -85,6 +88,14 @@ class Config:
         known = Config.__dataclass_fields__
         over.setdefault("pod_name", f"{self.pod_name}-{name}")
         return replace(self, **{k: v for k, v in over.items() if k in known and k != "pools"})
+
+    @property
+    def allowed_cuda_versions(self) -> list[str] | None:
+        """RunPod's host filter wants an explicit list: every known CUDA version ≥ min_cuda."""
+        if not self.min_cuda:
+            return None
+        key = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
+        return [v for v in CUDA_VERSIONS if key(v) >= key(self.min_cuda)] or [self.min_cuda]
 
     @property
     def public_key(self) -> str:

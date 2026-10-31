@@ -15,7 +15,19 @@ from . import ledger, ssh
 from .config import HOME, REMOTE_OGPU, Config, State, api_key, load_state, save_state
 from .providers.runpod import Pod, RunPod, RunPodError
 
-REMOTE_FILES = ("jobrun.py", "reaper.py")
+REMOTE_FILES = ("jobrun.py", "reaper.py", "reaperguard.sh")
+REAPER_STALE_S = 120   # reaper.json not refreshed for this long = the reaper is dead or wedged
+HEALTH_PROBE = r"""[ -f /workspace/.ogpu/env.sh ] && source /workspace/.ogpu/env.sh
+python3 - <<'PY'
+try:
+    import torch
+except Exception as e:
+    print("SKIP no torch:", e)
+    raise SystemExit(0)
+torch.zeros(1, device="cuda").add_(1)
+torch.cuda.synchronize()
+print("OK", torch.cuda.get_device_name(), "torch cuda", torch.version.cuda)
+PY"""
 
 
 def client() -> RunPod:
@@ -49,8 +61,9 @@ def helpers_version() -> str:
     return hashlib.sha256(b"".join(src.joinpath(n).read_bytes() for n in REMOTE_FILES)).hexdigest()[:16]
 
 
-def install_helpers(st: State, cfg: Config) -> None:
-    """Copy jobrun/reaper to the pod, write the reaper config, and make sure exactly one reaper runs."""
+def install_helpers(st: State, cfg: Config, *, reset_idle: bool = True) -> None:
+    """Copy jobrun/reaper to the pod, write the reaper config, and make sure exactly one reaper (plus the guard that
+    restarts it) runs. `reset_idle=False` when only reviving a dead reaper: that must not extend the idle clock."""
     key = cfg.private_key_path
     src = resources.files("ogpu.remote")
     files = {name: src.joinpath(name).read_text() for name in REMOTE_FILES}
@@ -60,12 +73,17 @@ def install_helpers(st: State, cfg: Config) -> None:
     script.append(f"echo {helpers_version()} > {REMOTE_OGPU}/bin/VERSION")
     cfg_json = json.dumps({"idle_minutes": cfg.idle_minutes})
     script.append(f"echo {shlex.quote(cfg_json)} > {REMOTE_OGPU}/config.json")
-    # reset the idle clock: a stale boot-time stamp would make the reaper stop the pod right after `up`
-    script.append(f"date +%s > {REMOTE_OGPU}/last_activity")
-    # restart the reaper so it runs the current code (anchored so it can't match this shell's own command line)
+    if reset_idle:  # a stale boot-time stamp would make the reaper stop the pod right after `up`
+        script.append(f"date +%s > {REMOTE_OGPU}/last_activity")
+    # restart guard + reaper so they run the current code (patterns anchored so they can't match this shell).
+    # setsid: nothing from this SSH session (hangup, session teardown) can reach them afterwards.
+    # kill the guard's whole process group (it runs under setsid): a surviving `sleep` child would keep holding
+    # the guard's lock and make the new guard exit at once
+    script.append(f"for p in $(pgrep -f '^bash {REMOTE_OGPU}/bin/reaperguard.sh'); do kill -9 -- -$p; done 2>/dev/null; true")
     script.append(f"pkill -f '^python3 {REMOTE_OGPU}/bin/reaper.py' || true; rm -f {REMOTE_OGPU}/reaper.pid")
-    script.append(f"bash -c 'set -a; [ -f {REMOTE_OGPU}/env.sh ] && source {REMOTE_OGPU}/env.sh; "
-                  f"nohup python3 {REMOTE_OGPU}/bin/reaper.py >> {REMOTE_OGPU}/reaper.log 2>&1 < /dev/null &' ")
+    script.append(f"bash -c 'set -a; [ -f {REMOTE_OGPU}/env.sh ] && source {REMOTE_OGPU}/env.sh; set +a; "
+                  f"setsid nohup python3 {REMOTE_OGPU}/bin/reaper.py >> {REMOTE_OGPU}/reaper.log 2>&1 < /dev/null & "
+                  f"sleep 1; setsid nohup bash {REMOTE_OGPU}/bin/reaperguard.sh >/dev/null 2>&1 < /dev/null &' ")
     ssh.run(st, key, "\n".join(script), timeout=60)
 
 
@@ -117,6 +135,23 @@ def up(cfg: Config, console: Console, *, retry_minutes: float = 0, pool: str = "
             console.print(f"[grey50]deleted stuck pod {stuck.id}[/]")
         except RunPodError as e:
             console.print(f"[yellow]could not delete stuck pod {stuck.id}: {e} — remove it in the RunPod console[/]")
+    for attempt in range(3):
+        ok, detail = gpu_health(st, cfg)
+        if ok:
+            break
+        # a host whose driver can't run the image's CUDA fails every job (the H100 NVL on driver 12.8 did, all
+        # evening): never hand it to agents — replace it with a pod on another host
+        console.print(f"[red]✘[/] {pool} pod {st.pod_id} failed the GPU check: {detail}")
+        if attempt == 2:
+            raise SystemExit(f"{pool}: 3 pods in a row failed the GPU check; last: {detail}")
+        console.print("[yellow]↻[/] deleting it and creating a pod on another host…")
+        try:
+            rp.terminate(st.pod_id)
+        except RunPodError as e:
+            console.print(f"[yellow]could not delete {st.pod_id}: {e} — remove it in the RunPod console[/]")
+        save_state(State(), pool)
+        pod = create_with_fallback(rp, cfg, console, retry_minutes, pool)
+        st = wait_reachable(rp, pod.id, cfg, console, pool=pool)
     import_pod_sessions(st, cfg)
     install_helpers(st, cfg)
     console.print(f"[green]✔[/] ready  [magenta]{pool}[/]  [bold]{st.gpu}[/]  root@{st.host}:{st.port}  ${st.cost_per_hr:.2f}/hr  "
@@ -133,10 +168,7 @@ def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minute
         for gpu in cfg.gpu_type_ids:
             for cloud in cfg.cloud_types:
                 try:
-                    pod = rp.create(name=cfg.pod_name, image=cfg.image, gpu_type_id=gpu, cloud=cloud,
-                                    container_disk_gb=cfg.container_disk_gb, volume_gb=cfg.volume_gb,
-                                    network_volume_id=cfg.network_volume_id, public_key=cfg.public_key,
-                                    min_vcpu=cfg.min_vcpu, min_memory_gb=cfg.min_memory_gb)
+                    pod = create_one(rp, cfg, gpu, cloud)
                     console.print(f"[green]✔[/] created pod [bold]{pod.id}[/] · {gpu} · {cloud.lower()} cloud")
                     sync_state(pod, cloud=cloud.lower(), pool=pool)
                     return pod
@@ -146,6 +178,47 @@ def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minute
             raise SystemExit("no capacity:\n  " + "\n  ".join(errors) + "\n  try `ogpu up --retry 30` to keep polling")
         console.print(f"[yellow]…[/] no capacity (attempt {attempt}); retrying in 30s")
         time.sleep(30)
+
+
+def create_one(rp: RunPod, cfg: Config, gpu: str, cloud: str) -> Pod:
+    kw = dict(name=cfg.pod_name, image=cfg.image, gpu_type_id=gpu, cloud=cloud,
+              container_disk_gb=cfg.container_disk_gb, volume_gb=cfg.volume_gb,
+              network_volume_id=cfg.network_volume_id, public_key=cfg.public_key,
+              min_vcpu=cfg.min_vcpu, min_memory_gb=cfg.min_memory_gb)
+    try:
+        return rp.create(**kw, allowed_cuda=cfg.allowed_cuda_versions)
+    except RunPodError as e:
+        if "cuda" not in str(e).lower():
+            raise
+        return rp.create(**kw)  # the API rejected the filter itself: the post-boot GPU check still guards us
+
+
+def parse_health(rc: int, out: str) -> tuple[bool, str]:
+    """→ (usable, detail) from HEALTH_PROBE's exit code and output."""
+    lines = [l for l in out.strip().splitlines() if l.strip()]
+    last = lines[-1] if lines else f"exit {rc}"
+    if rc == 0 and lines and (last.startswith("OK") or last.startswith("SKIP")):
+        return True, last
+    hint = next((l for l in reversed(lines) if "driver" in l.lower() or "cuda" in l.lower()), last)
+    return False, hint[:300]
+
+
+def gpu_health(st: State, cfg: Config) -> tuple[bool, str]:
+    """Allocate on the GPU through the image's own torch, retrying once (a GPU can be slow right after boot)."""
+    detail = ""
+    for i in range(2):
+        try:
+            p = ssh.run(st, cfg.private_key_path, HEALTH_PROBE, check=False, timeout=180)
+            if p.returncode == 255:  # ssh's own failure code: no verdict on the GPU
+                return True, "check skipped (ssh error)"
+            ok, detail = parse_health(p.returncode, p.stdout + p.stderr)
+        except Exception as e:  # noqa: BLE001 — SSH trouble is not a verdict on the GPU
+            return True, f"check skipped ({type(e).__name__})"
+        if ok:
+            return True, detail
+        if i == 0:
+            time.sleep(10)
+    return False, detail
 
 
 def import_pod_sessions(st: State, cfg: Config) -> None:
@@ -165,14 +238,31 @@ def import_pod_sessions(st: State, cfg: Config) -> None:
                 continue
 
 
-def upgrade_helpers(st: State, cfg: Config) -> None:
-    """Push new jobrun/reaper versions after an `ogpu` update (running jobs keep the code they started with)."""
+def reaper_alive(heartbeat: str, now: str) -> bool:
     try:
-        remote = ssh.run(st, cfg.private_key_path, f"cat {REMOTE_OGPU}/bin/VERSION 2>/dev/null", check=False).stdout
+        return int(now) - int(float(heartbeat)) <= REAPER_STALE_S
+    except ValueError:
+        return False
+
+
+def upgrade_helpers(st: State, cfg: Config, console: Console | None = None) -> None:
+    """Push new jobrun/reaper versions after an `ogpu` update (running jobs keep the code they started with), and
+    revive the reaper if its heartbeat went stale — a dead reaper means the pod never stops (Oct 31: ~4.7 idle hours)."""
+    try:
+        out = ssh.run(st, cfg.private_key_path,
+                      f"echo v=$(cat {REMOTE_OGPU}/bin/VERSION 2>/dev/null); "
+                      f"echo hb=$(stat -c %Y {REMOTE_OGPU}/reaper.json 2>/dev/null); echo now=$(date +%s)",
+                      check=False).stdout
     except Exception:  # noqa: BLE001
         return
-    if remote.strip() != helpers_version():
+    kv = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    version, heartbeat, now = kv.get("v", "").strip(), kv.get("hb", "").strip(), kv.get("now", "").strip()
+    if version != helpers_version():
         install_helpers(st, cfg)
+    elif not reaper_alive(heartbeat, now):
+        if console:
+            console.print("[yellow]↻[/] idle reaper was not running on the pod — restarted it")
+        install_helpers(st, cfg, reset_idle=False)
 
 
 def ensure(cfg: Config, console: Console, pool: str = "timing") -> State:
@@ -180,7 +270,7 @@ def ensure(cfg: Config, console: Console, pool: str = "timing") -> State:
     `cfg` is the pool's config."""
     st = load_state(pool)
     if ssh.reachable(st, cfg.private_key_path):
-        upgrade_helpers(st, cfg)
+        upgrade_helpers(st, cfg, console)
         return st
     if not cfg.auto_up:
         raise SystemExit(f"{pool} pod not reachable; run `ogpu up --pool {pool}` (or set auto_up = true)")

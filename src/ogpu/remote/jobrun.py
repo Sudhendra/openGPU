@@ -62,6 +62,33 @@ def all_jobs():
     return sorted(out, key=lambda j: j["created"])
 
 
+def boot_id(proc="/proc"):
+    """This container's start time (PID 1's start). Job records live on the persistent volume and outlive the
+    container; after a stop/resume, PIDs are recycled, so a pid is only meaningful together with the boot it
+    was recorded in."""
+    try:
+        with open(f"{proc}/1/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open(f"{proc}/stat") as f:
+            btime = next(int(l.split()[1]) for l in f if l.startswith("btime"))
+        return round(btime + ticks / os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+
+
+BOOT = boot_id()
+
+
+def same_boot(rec):
+    """False when the record was written by an earlier container (its pids now belong to unrelated processes)."""
+    if BOOT is None:
+        return True
+    b = rec.get("boot")
+    if b is not None:
+        return abs(b - BOOT) <= 2
+    return (rec.get("created") or rec.get("since") or 0) >= BOOT  # legacy record: judge by its timestamp
+
+
 def alive(pid):
     try:
         os.kill(pid, 0)
@@ -73,6 +100,11 @@ def alive(pid):
 def reconcile(j):
     """A job whose runner died is marked lost instead of hanging forever — and its own processes are killed, so an
     orphan can never keep using the GPU (or hold the inherited GPU lock) behind everyone's back."""
+    if j["status"] in ("queued", "running") and not same_boot(j):
+        # the container restarted under it: its pids are recycled, so never signal them — just close the record
+        j.update(status="lost", ended=time.time(), exit_code=-1, orphan_killed=False, lost_reason="pod restarted")
+        write_job(j)
+        return j
     starting = j.get("runner_pid") is None and time.time() - j["created"] < 30
     if j["status"] in ("queued", "running") and not starting and not alive(j.get("runner_pid")):
         orphan = alive(j.get("pid"))
@@ -103,7 +135,7 @@ def holder():
     try:
         with open(HOLDER) as f:
             h = json.load(f)
-        return h if alive(h.get("runner_pid")) else None
+        return h if same_boot(h) and alive(h.get("runner_pid")) else None
     except (OSError, ValueError):
         return None
 
@@ -117,7 +149,8 @@ def cmd_start(spec_b64):
     for root in job.get("roots") or [job["cwd"]]:
         subprocess.run(["cp", "-a", root, run_dir + "/"], check=True)
     job["cwd"] = f"{run_dir}/{os.path.basename(job['cwd'])}"
-    job.update(status="queued", created=time.time(), started=None, ended=None, exit_code=None, runner_pid=None)
+    job.update(status="queued", created=time.time(), started=None, ended=None, exit_code=None, runner_pid=None,
+               boot=BOOT)
     write_job(job)
     open(jpath(job["id"], "log"), "wb").close()
     touch()
@@ -216,7 +249,7 @@ def cmd_exec(jid):
         fcntl.flock(lockf, fcntl.LOCK_EX)
         with open(HOLDER, "w") as f:
             json.dump({k: job.get(k) for k in ("id", "agent", "track", "cmd")} | {"runner_pid": os.getpid(),
-                      "since": time.time()}, f)
+                      "since": time.time(), "boot": BOOT}, f)
     job = read_job(jid) or job
     job.update(status="running", started=time.time())
     write_job(job)

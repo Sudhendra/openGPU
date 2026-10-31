@@ -102,7 +102,7 @@ class RunPod:
 
     def create(self, *, name: str, image: str, gpu_type_id: str, cloud: str, container_disk_gb: int,
                volume_gb: int, network_volume_id: str, public_key: str, min_vcpu: int = 8,
-               min_memory_gb: int = 32) -> Pod:
+               min_memory_gb: int = 32, allowed_cuda: list[str] | None = None) -> Pod:
         boot = resources.files("ogpu.remote").joinpath("bootstrap.sh").read_bytes()
         inp = {
             "name": name, "imageName": image, "gpuTypeId": gpu_type_id, "gpuCount": 1,
@@ -112,6 +112,7 @@ class RunPod:
             "networkVolumeId": network_volume_id or None,
             "volumeMountPath": "/workspace", "ports": "22/tcp",
             "minVcpuCount": min_vcpu, "minMemoryInGb": min_memory_gb,
+            "allowedCudaVersions": allowed_cuda,  # hosts with an older driver can't run the image's torch
             # custom images ignore startSsh, so the start command installs sshd itself (see remote/bootstrap.sh)
             "dockerArgs": "bash -c 'echo $OGPU_BOOTSTRAP | base64 -d > /ogpu_boot.sh && exec bash /ogpu_boot.sh'",
             "env": [{"key": "OGPU_BOOTSTRAP", "value": base64.b64encode(boot).decode()},

@@ -22,7 +22,10 @@ export -p | grep -vE ' (OGPU_BOOTSTRAP|HOSTNAME|PWD|OLDPWD|SHLVL|_)=' > "$OG/env
 chmod 600 "$OG/env.sh"
 date +%s > "$OG/last_activity"
 
-if [ -f "$OG/bin/reaper.py" ]; then
+if [ -f "$OG/bin/reaperguard.sh" ]; then  # the guard starts the reaper and restarts it if it ever dies
+  rm -f "$OG/reaper.pid"
+  setsid nohup bash "$OG/bin/reaperguard.sh" >/dev/null 2>&1 < /dev/null &
+elif [ -f "$OG/bin/reaper.py" ]; then
   nohup python3 "$OG/bin/reaper.py" >> "$OG/reaper.log" 2>&1 &
 fi
 exec sleep infinity
