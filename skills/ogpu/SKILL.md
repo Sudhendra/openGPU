@@ -50,6 +50,15 @@ ogpu status --json    # pod state + today's spend vs the daily cap
 
 **Always pass `-m/--note`** with the hypothesis. It's stored in the shared ledger so other agents (and you, after a context reset) can see what was tried.
 
+## Sweeps (tournaments): the fastest way to compare many candidates
+```bash
+ogpu sweep --json --best submission_best.py cand_a.py cand_b.py 'submission_pf.py@PF_ON=False' -m "<hypothesis>"
+```
+Stages run automatically: (optional `--compile "python3 pod/x_build.py {file}"` on CPU) → correctness of all candidates in ONE job on the cheap pool (`--check-flag "--check" --correct-args "--reps 3"`) → quick timing of best + survivors on the H200 (`--quick-args "--reps 5"`) → full timing of best + finalists only (`--full-args "--reps 20"`, `--top-k 2`). Wrong candidates are never timed.
+- Report: `recommend` is set **only** if a candidate beats `--best` by more than `--noise` (default 0.015). `verdict` says why. Each candidate has `stage` reached, `dropped` (reason), `check_margin`, `quick`, `full`, `vs_best`.
+- `okc check` only the `recommend`ed candidate. `recommend: null` means nothing beat the best: don't spend quota.
+- Bench contract: the bench takes candidates as arguments and prints `CHECK <case> <name> <tag>: PASS|FAIL ...` and `SCORE <name>: <x>` per candidate (decode/attention/MoE `pod/bench.py` already do). Other scripts: `--bench "python3 my_bench.py {files} --flag"`.
+
 ## The result line (`--json`)
 ```json
 {"id": "1030-164825-d47177", "status": "done", "failure": null, "error": null, "exit_code": 0, "wall_s": 212.4,
