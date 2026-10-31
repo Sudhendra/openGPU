@@ -32,6 +32,7 @@ ssh_private_key = "~/.ssh/id_ed25519"
 idle_minutes = 20                      # on-pod reaper stops the pod after this much idle time
 budget_usd = 60.0                      # daily cap: `ogpu run --gpu` refuses new work beyond it
 auto_up = true                         # `ogpu run` resumes/creates the pod if it is not running
+quiet_timing = true                    # CPU jobs run niced on non-reserved cores so they can't disturb GPU timings
 """
 
 
@@ -51,6 +52,7 @@ class Config:
     idle_minutes: int = 20
     budget_usd: float = 60.0
     auto_up: bool = True
+    quiet_timing: bool = True
 
     @property
     def public_key(self) -> str:

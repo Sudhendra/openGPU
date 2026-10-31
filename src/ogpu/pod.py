@@ -8,6 +8,7 @@ import shlex
 import time
 from importlib import resources
 
+import requests
 from rich.console import Console
 
 from . import ledger, ssh
@@ -72,7 +73,11 @@ def wait_reachable(rp: RunPod, pod_id: str, cfg: Config, console: Console, timeo
     t0 = time.time()
     with console.status("[cyan]booting pod · waiting for public SSH…") as s:
         while time.time() - t0 < timeout_s:
-            pod = rp.pod(pod_id)
+            try:
+                pod = rp.pod(pod_id)
+            except (RunPodError, requests.RequestException):  # transient API hiccup: keep waiting
+                time.sleep(5)
+                continue
             if pod and pod.ssh_port:
                 st = sync_state(pod)
                 err = f" · [red]{ssh.last_error}[/]" if ssh.last_error and time.time() - t0 > 60 else ""

@@ -143,6 +143,44 @@ def wait_with_timeout(p, timeout_s, log):
         return 124
 
 
+def cpu_budget(cgroup_root="/sys/fs/cgroup"):
+    """→ (allowed cpu ids, effective cpus). Containers often see every host core (nproc=192) but are throttled to a
+    CFS quota (e.g. 20.4 CPUs); build tools that size themselves from nproc then thrash the quota and throttle
+    everything in the container — including a timing run."""
+    allowed = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else list(range(os.cpu_count() or 1))
+    eff = float(len(allowed))
+    try:
+        with open(f"{cgroup_root}/cpu.max") as f:  # cgroup v2: "<quota> <period>" or "max <period>"
+            q, per = f.read().split()[:2]
+        if q != "max":
+            eff = min(eff, int(q) / int(per))
+    except (OSError, ValueError):
+        try:  # cgroup v1
+            with open(f"{cgroup_root}/cpu/cpu.cfs_quota_us") as f:
+                q = int(f.read())
+            with open(f"{cgroup_root}/cpu/cpu.cfs_period_us") as f:
+                per = int(f.read())
+            if q > 0:
+                eff = min(eff, q / per)
+        except (OSError, ValueError):
+            pass
+    return allowed, max(1.0, eff)
+
+
+def isolation(mode, allowed, eff, quiet=True):
+    """Build parallelism sized to the real CPU budget for every job; CPU jobs additionally leave headroom for
+    timing (reserved cores, lowest priority). → (env overrides, cpu ids to pin or None, nice)"""
+    total = max(1, int(eff))
+    if mode != "cpu" or not quiet:
+        n, cores, nice = total, None, 0
+    else:
+        reserve = max(1, min(4, total // 4))
+        n = max(1, total - reserve)
+        cores, nice = allowed[-n:], 19  # reserved headroom = the lowest-numbered cores
+    env = {"MAX_JOBS": str(n), "CMAKE_BUILD_PARALLEL_LEVEL": str(n), "MAKEFLAGS": f"-j{n}"}
+    return env, cores, nice
+
+
 def cmd_exec(jid):
     job = read_job(jid)
     job["runner_pid"] = os.getpid()
@@ -157,11 +195,26 @@ def cmd_exec(jid):
     job.update(status="running", started=time.time())
     write_job(job)
     touch()
-    shell = f"[ -f {OG}/env.sh ] && source {OG}/env.sh; cd {json.dumps(job['cwd'])} && {job['cmd']}"
+    allowed, eff = cpu_budget()
+    env_over, cores, nice = isolation(job["mode"], allowed, eff, job.get("quiet", True))
+    job["isolation"] = {"cpu_budget": round(eff, 1), "max_jobs": int(env_over["MAX_JOBS"]),
+                        "pinned_cores": len(cores) if cores else None, "nice": nice}
+    write_job(job)
+    exports = " ".join(f"{k}={v}" for k, v in env_over.items())
+    # env.sh first (container env), then our overrides so they win; a user's own MAX_JOBS in the cmd still wins
+    shell = (f"[ -f {OG}/env.sh ] && source {OG}/env.sh; export {exports}; "
+             f"cd {json.dumps(job['cwd'])} && {job['cmd']}")
+
+    def limit():
+        if cores and hasattr(os, "sched_setaffinity"):
+            os.sched_setaffinity(0, cores)
+        if nice:
+            os.nice(nice)
+
     with open(jpath(jid, "log"), "ab", buffering=0) as log:
         try:
             p = subprocess.Popen(["bash", "-c", shell], stdout=log, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True)
+                                 stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=limit)
             job["pid"] = p.pid
             write_job(job)
             rc = wait_with_timeout(p, job.get("timeout_s"), log)

@@ -79,6 +79,8 @@ class RunPod:
             raise RunPodError(f"HTTP {r.status_code}: {r.text[:300]}")
         if body.get("errors"):
             raise RunPodError("; ".join(e.get("message", str(e)) for e in body["errors"]))
+        if "data" not in body:  # rate limits / gateway errors come back as JSON without data
+            raise RunPodError(f"HTTP {r.status_code}: {str(body)[:300]}")
         return body["data"]
 
     def pods(self) -> list[Pod]:

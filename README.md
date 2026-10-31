@@ -25,7 +25,7 @@ GPU time is expensive. Most of the bill isn't GPU work:
 |---|---|
 | **One-command machines** | `ogpu up` reuses, resumes or creates a GPU machine in your image, with fallback across GPU types and cloud tiers. Real SSH, no proxies. |
 | **Never pay for idle** | An on-machine reaper stops the machine after *N* idle minutes. Disks and compiled caches persist, so `ogpu up` resumes warm. |
-| **Safe sharing** | GPU jobs queue behind an exclusive lock, so timings never overlap. CPU jobs (compile gates) run in parallel. Every job runs from its own code snapshot. |
+| **Safe sharing** | GPU jobs queue behind an exclusive lock, so timings never overlap. CPU jobs (compile gates) run in parallel without disturbing timings: builds are capped to the container's real CPU quota, run at lowest priority, and stay off reserved cores. Every job runs from its own code snapshot. |
 | **Never pay twice** | A content-hash cache (sources + command + image) returns identical runs instantly. Identical in-flight jobs are deduplicated across agents. |
 | **Shared ledger** | Every run's metrics, failure type, hypothesis note, cost and agent in one SQLite ledger: `ogpu ledger`, `ogpu show`. |
 | **Agent-native** | One-line JSON results, failure classification with error excerpts, async `submit`/`wait`, meaningful exit codes, and a drop-in agent skill and guard hook. |
@@ -123,6 +123,7 @@ With `--json`, every run ends with one line:
 | `volume_gb` / `container_disk_gb` | `100` / `60` | Persistent volume at `/workspace` / container disk |
 | `min_vcpu` / `min_memory_gb` | `8` / `32` | Host requirements |
 | `auto_up` | `true` | `ogpu run` brings the machine up if needed |
+| `quiet_timing` | `true` | Size build parallelism to the container's real CPU quota; CPU jobs run niced on non-reserved cores so they can't disturb GPU timings |
 
 Environment: `RUNPOD_API_KEY` (required), `OGPU_AGENT`, `OGPU_HOME` (default `~/.ogpu`), `OGPU_NO_NOTIFY`.
 

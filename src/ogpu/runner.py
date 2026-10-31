@@ -103,7 +103,7 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
     k = cfg.private_key_path
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     spec = {"id": jid, "agent": agent, "track": track.name, "cmd": cmd, "mode": mode, "cwd": remote_dir(track),
-            "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s}
+            "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing}
     # push + submit (which snapshots the synced dirs on the pod) must not interleave with another agent's push
     with open(HOME / f"push-{track.name}.lock", "w") as lk, console.status(f"[cyan]syncing {track.name}…"):
         fcntl.flock(lk, fcntl.LOCK_EX)
