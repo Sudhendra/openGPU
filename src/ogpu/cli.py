@@ -192,6 +192,41 @@ def wait(ids: list[str] = typer.Argument(..., help="job ids from `ogpu submit`")
     raise typer.Exit(worst)
 
 
+@app.command(context_settings={"allow_interspersed_args": True})
+def sweep(cands: list[str] = typer.Argument(..., help="candidate files / variants (file.py@NAME=VAL) to compare"),
+          best: Optional[str] = typer.Option(None, "--best", "-b", help="current best (timed alongside, never dropped)"),
+          bench: str = typer.Option("python3 pod/bench.py", "--bench",
+                                    help="bench command; candidates are appended (or replace {files})"),
+          compile_tpl: Optional[str] = typer.Option(None, "--compile", help="per-candidate CPU gate; {file} = path"),
+          check_flag: str = typer.Option("--check", "--check-flag", help="flag that makes the bench run checks"),
+          correct_args: str = typer.Option("--reps 3", "--correct-args", help="extra args for the correctness stage"),
+          quick_args: str = typer.Option("--reps 5", "--quick-args", help="args for the quick timing stage"),
+          full_args: str = typer.Option("--reps 20", "--full-args", help="args for the full timing stage"),
+          top_k: int = typer.Option(2, "--top-k", "-k", help="finalists kept after quick timing"),
+          noise: float = typer.Option(0.015, "--noise", help="relative win needed to beat best / stay in contention"),
+          track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT, note: str = NOTE_OPT,
+          timeout: Optional[float] = TIMEOUT_OPT, force: bool = FORCE_OPT,
+          as_json: bool = typer.Option(False, "--json", help="one JSON report on stdout")):
+    """Tournament: compile (CPU) → correctness (cheap pool) → quick timing → full timing for finalists → ranked verdict.
+
+    Most candidates never reach the expensive GPU, and each stage is one batched job (prepare paid once)."""
+    from . import sweep as sw
+    con = Console(stderr=True, quiet=as_json)
+    try:
+        run = sw.Sweep(load_config(), con, track=track.resolve(), extra=with_, cands=cands, best=best, bench=bench,
+                       compile_tpl=compile_tpl, check_flag=check_flag, correct_args=correct_args,
+                       quick_args=quick_args, full_args=full_args, top_k=top_k, noise=noise, note=note,
+                       timeout_s=timeout, force=force)
+        rep = run.run()
+    except runner.BudgetExceeded as e:
+        print(json.dumps({"status": "budget_exceeded", "error": e.msg}))
+        raise typer.Exit(2)
+    if as_json:
+        print(json.dumps(rep))
+    else:
+        sw.print_report(Console(), rep)
+
+
 @app.command()
 def top(pool: Optional[str] = typer.Option(None, "--pool", "-p", help="show only this pool (default: all)")):
     """Live dashboard for every pod: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdowns."""
@@ -253,8 +288,8 @@ def ledger_cmd(track: Optional[str] = typer.Option(None, "--track", "-t"),
         rows.sort(key=lambda r: ledger.best_score(r["metrics"]), reverse=True)
     rows = rows[:limit]
     if as_json:
-        keep = ("id", "agent", "track", "cmd", "mode", "status", "failure", "error", "note", "metrics", "wall_s",
-                "cost_usd", "ended", "cached_from")
+        keep = ("id", "agent", "track", "cmd", "mode", "pool", "status", "failure", "error", "note", "metrics",
+                "wall_s", "cost_usd", "ended", "cached_from")
         print(json.dumps([{k: r.get(k) for k in keep} for r in rows]))
         return
     t = Table(box=None, header_style="bold magenta", pad_edge=False)
