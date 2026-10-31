@@ -106,8 +106,10 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
     st = pod.ensure(pcfg, console, pool)
     k = cfg.private_key_path
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    timeout_s = timeout_s or cfg.default_timeout_s or None
     spec = {"id": jid, "agent": agent, "track": track.name, "cmd": cmd, "mode": mode, "cwd": remote_dir(track),
-            "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing}
+            "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing,
+            **hang_policy(cfg, db, track.name, cmd, pool)}
     # push + submit (which snapshots the synced dirs on the pod) must not interleave with another agent's push
     with open(HOME / f"push-{pool}-{track.name}.lock", "w") as lk, console.status(f"[cyan]syncing {track.name}…"):
         fcntl.flock(lk, fcntl.LOCK_EX)
@@ -120,6 +122,15 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
                   extra_paths=json.dumps([str(e.resolve()) for e in extra]),
                   failure=None, error=None, timeout_s=timeout_s, submitted=now, pool=pool)
     return {"id": jid, "status": "queued"}
+
+
+def hang_policy(cfg: Config, db, track: str, cmd: str, pool: str) -> dict:
+    """What 'hung' means for this job, from how long the same command took before (watchdog on the pod)."""
+    usual, n = ledger.usual_runtime(db, track, cmd, pool)
+    policy = {"spin_silent_s": cfg.spin_silent_s, "hang_silent_s": 60}
+    if n >= 2 and usual > 0:
+        policy |= {"usual_s": round(usual, 1), "hang_after_s": max(cfg.hang_floor_s, cfg.hang_factor * usual)}
+    return policy
 
 
 def choose_pool(cfg: Config, console: Console, mode: str, fidelity: str) -> str:
@@ -176,14 +187,17 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
         log_path = Path(row["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_bytes(b"")  # poll_loop re-reads from offset 0
-        status, rc, started, ended = poll_loop(console, st, k, jid, log_path, stream=stream, pool=pool)
+        status, rc, started, ended, last = poll_loop(console, st, k, jid, log_path, stream=stream, pool=pool)
         track = Path(row["track_path"] or ".")
         out_local = track / "output" / "ogpu" / jid
         if ssh.pull(st, k, f"{REMOTE_ROOT}/.runs/{jid}/{row['track']}/out", out_local) and not any(out_local.iterdir()):
             out_local.rmdir()
         log = log_path.read_text(errors="replace")
         metrics = ledger.parse_metrics(log)
-        failure, error = failures.classify(status, rc, log, metrics)
+        failure, error = failures.classify(status, rc, log, metrics, hang=last.get("hang"))
+        if status == "lost" and (last.get("runner_signal") or last.get("orphan_killed")):
+            error = (error or "") + (f"\nrunner got {last['runner_signal']}" if last.get("runner_signal") else "") + \
+                    ("\norphaned job process was killed" if last.get("orphan_killed") else "")
         wall = (ended or time.time()) - (started or time.time()) if started else 0.0
         prev_best = ledger.track_best(db, row["track"], exclude_id=jid)
         ledger.update(db, jid, status=status, exit_code=rc, started=started, ended=ended or time.time(), wall_s=wall,
@@ -196,6 +210,8 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
             r["advice"] = (f"checks passed on the {pool} pool but the worst error is at "
                            f"{metrics['check_margin']:.0%} of the bound — confirm with --fidelity timing")
         b = ledger.best_score(metrics)
+        if failure == "hang":
+            notify.send("ogpu · hung job killed", f"{row['track']} ({row['agent']}): {(last.get('hang') or {}).get('reason', '')}")
         if not failure and b is not None and (prev_best is None or b > prev_best):
             r["new_best"] = True
             notify.send("ogpu · new best", f"{row['track']}: {b:.4f}× ({row['agent']})"
@@ -286,7 +302,7 @@ def poll_loop(console: Console, st: State, key: str, jid: str, log_path: Path, *
                     spinner.update(f"[cyan]waiting for H200 lock · position {d.get('queue_pos')}{who}")
                     spinner.start()
                 if status in ledger.TERMINAL:
-                    return status, d.get("exit_code"), d.get("started"), d.get("ended")
+                    return status, d.get("exit_code"), d.get("started"), d.get("ended"), d
                 time.sleep(0.25 if chunk else 1.0)
     except KeyboardInterrupt:
         console.print(f"\n[yellow]detached[/] — job {jid} keeps running. `ogpu wait {jid}` / `ogpu cancel {jid}`")

@@ -71,12 +71,25 @@ def alive(pid):
 
 
 def reconcile(j):
-    """A job whose runner died (pod restart, OOM-kill) is marked lost instead of hanging forever."""
+    """A job whose runner died is marked lost instead of hanging forever — and its own processes are killed, so an
+    orphan can never keep using the GPU (or hold the inherited GPU lock) behind everyone's back."""
     starting = j.get("runner_pid") is None and time.time() - j["created"] < 30
     if j["status"] in ("queued", "running") and not starting and not alive(j.get("runner_pid")):
-        j.update(status="lost", ended=time.time(), exit_code=-1)
+        orphan = alive(j.get("pid"))
+        if orphan:
+            kill_group(j["pid"], signal.SIGKILL)
+        j = read_job(j["id"]) or j  # merge with anything written since (e.g. runner_signal)
+        j.update(status="lost", ended=time.time(), exit_code=-1, orphan_killed=orphan)
         write_job(j)
     return j
+
+
+def kill_group(pid, sig):
+    try:
+        os.killpg(pid, sig)
+        return True
+    except (OSError, TypeError):
+        return False
 
 
 def queue_position(job, jobs):
@@ -185,6 +198,18 @@ def cmd_exec(jid):
     job = read_job(jid)
     job["runner_pid"] = os.getpid()
     write_job(job)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)  # a dropped SSH session must never take a runner down
+
+    def on_term(signum, _frame):  # record why the runner is going away, then take the job with it
+        j = read_job(jid) or job
+        j["runner_signal"] = signal.Signals(signum).name
+        write_job(j)
+        if job.get("pid"):
+            kill_group(job["pid"], signal.SIGKILL)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
     lockf = None
     if job["mode"] == "gpu":
         lockf = open(LOCK, "a")
@@ -192,6 +217,7 @@ def cmd_exec(jid):
         with open(HOLDER, "w") as f:
             json.dump({k: job.get(k) for k in ("id", "agent", "track", "cmd")} | {"runner_pid": os.getpid(),
                       "since": time.time()}, f)
+    job = read_job(jid) or job
     job.update(status="running", started=time.time())
     write_job(job)
     touch()
@@ -213,16 +239,22 @@ def cmd_exec(jid):
 
     with open(jpath(jid, "log"), "ab", buffering=0) as log:
         try:
+            # the job inherits the GPU lock's file description: if this runner dies, the lock stays held until
+            # the job itself exits, so a running orphan can never overlap another agent's timing
             p = subprocess.Popen(["bash", "-c", shell], stdout=log, stderr=subprocess.STDOUT,
-                                 stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=limit)
+                                 stdin=subprocess.DEVNULL, start_new_session=True, preexec_fn=limit,
+                                 pass_fds=(lockf.fileno(),) if lockf else ())
             job["pid"] = p.pid
             write_job(job)
             rc = wait_with_timeout(p, job.get("timeout_s"), log)
+            kill_group(p.pid, signal.SIGKILL)  # reap leftovers (background children) so nothing outlives the job
         except OSError as e:
             log.write(f"ogpu: could not start job: {e}\n".encode())
             rc = 127
-    job.update(status="done" if rc == 0 else "failed", ended=time.time(), exit_code=rc)
-    write_job(job)
+    job = read_job(jid) or job  # keep fields the watchdog may have added (hang evidence)
+    if job.get("status") != "cancelled":
+        job.update(status="done" if rc == 0 else "failed", ended=time.time(), exit_code=rc)
+        write_job(job)
     if lockf:
         try:
             os.remove(HOLDER)
@@ -244,7 +276,8 @@ def cmd_poll(jid, offset):
     jobs = [reconcile(j) for j in all_jobs()]
     print(json.dumps({"status": job["status"], "exit_code": job["exit_code"], "queue_pos": queue_position(job, jobs),
                       "holder": holder(), "chunk": base64.b64encode(chunk).decode(), "offset": int(offset) + len(chunk),
-                      "started": job["started"], "ended": job["ended"]}))
+                      "started": job["started"], "ended": job["ended"], "hang": job.get("hang"),
+                      "runner_signal": job.get("runner_signal"), "orphan_killed": job.get("orphan_killed")}))
 
 
 def cmd_snapshot():
@@ -262,13 +295,10 @@ def cmd_snapshot():
 
 def cmd_cancel(jid):
     job = read_job(jid)
-    for pid in (job.get("pid"), job.get("runner_pid")):
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except (OSError, TypeError):
-            pass
-    job.update(status="cancelled", ended=time.time(), exit_code=-15)
+    job.update(status="cancelled", ended=time.time(), exit_code=-15)  # status first: the runner won't overwrite it
     write_job(job)
+    for pid in (job.get("pid"), job.get("runner_pid")):
+        kill_group(pid, signal.SIGTERM)
 
 
 if __name__ == "__main__":

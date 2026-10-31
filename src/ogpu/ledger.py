@@ -157,6 +157,16 @@ def update(db: sqlite3.Connection, run_id: str, **fields) -> None:
     db.commit()
 
 
+def usual_runtime(db: sqlite3.Connection, track: str, cmd: str, pool: str, last: int = 20) -> tuple[float, int]:
+    """(p90 wall seconds, n) over recent finished runs of this exact command on this pool."""
+    walls = sorted(r["wall_s"] for r in db.execute(
+        "select wall_s from runs where track=? and cmd=? and coalesce(pool,'timing')=? and status in ('done','failed') "
+        "and cached_from is null and wall_s > 0 order by ended desc limit ?", (track, cmd, pool, last)))
+    if not walls:
+        return 0.0, 0
+    return walls[min(len(walls) - 1, int(0.9 * len(walls)))], len(walls)
+
+
 def best_score(metrics: dict) -> float | None:
     vals = list((metrics.get("score") or {}).values())
     vals += [s["ratio_vs_s0"] for s in (metrics.get("sides") or {}).values() if s.get("ratio_vs_s0")]

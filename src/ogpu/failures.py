@@ -36,12 +36,15 @@ def excerpt(log: str, max_lines: int = 14) -> str:
     return "\n".join(reversed(hits)) or "\n".join(l[:240] for l in lines[-max_lines:])
 
 
-def classify(status: str, exit_code: int | None, log: str, metrics: dict) -> tuple[str | None, str | None]:
+def classify(status: str, exit_code: int | None, log: str, metrics: dict,
+             hang: dict | None = None) -> tuple[str | None, str | None]:
     """→ (failure, error). failure is None for a clean pass."""
+    if hang:  # the pod watchdog killed it; its evidence beats anything we could infer from the log
+        return "hang", f"watchdog: {hang.get('reason')}\n" + excerpt(log, 6)
     if status == "done" and metrics.get("checks", "PASS") == "PASS":
         return None, None
     if status == "lost":
-        return "lost", "pod restarted while the job ran; re-run it"
+        return "lost", "the job runner died (pod restart or killed process); re-run it"
     if status == "cancelled":
         return "cancelled", None
     if exit_code == 124:

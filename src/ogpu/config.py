@@ -34,6 +34,10 @@ budget_usd = 60.0                      # daily cap: `ogpu run --gpu` refuses new
 auto_up = true                         # `ogpu run` resumes/creates the pod if it is not running
 quiet_timing = true                    # CPU jobs run niced on non-reserved cores so they can't disturb GPU timings
 recreate_on_resume_failure = true      # stopped pod's host has no free GPU → create a new pod instead of failing
+default_timeout_s = 3600               # jobs without --timeout are killed after this long
+hang_factor = 5                        # hang = running > factor × this command's usual (p90) runtime, log quiet
+hang_floor_s = 180                     # ...but never flag a job as hung before this many seconds
+spin_silent_s = 900                    # GPU at ~100% util on low power with a silent log this long = deadlock
 
 # Pools: the settings above are the `timing` pool. Other pools override any of them.
 [pools.correctness]                    # `--fidelity correctness` jobs: cheap GPUs with the same ISA (sm_90a, like H200)
@@ -65,6 +69,10 @@ class Config:
     auto_up: bool = True
     quiet_timing: bool = True
     recreate_on_resume_failure: bool = True
+    default_timeout_s: float = 3600
+    hang_factor: float = 5
+    hang_floor_s: float = 180
+    spin_silent_s: float = 900
     pools: dict = field(default_factory=dict)
 
     def pool(self, name: str) -> "Config | None":

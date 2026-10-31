@@ -193,10 +193,11 @@ def wait(ids: list[str] = typer.Argument(..., help="job ids from `ogpu submit`")
 
 
 @app.command()
-def top(pool: str = POOL_OPT):
-    """Live dashboard: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdown."""
+def top(pool: Optional[str] = typer.Option(None, "--pool", "-p", help="show only this pool (default: all)")):
+    """Live dashboard for every pod: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdowns."""
     from .tui import run_top
-    _pool_cfg(pool)
+    if pool:
+        _pool_cfg(pool)
     run_top(load_config(), pool)
 
 
