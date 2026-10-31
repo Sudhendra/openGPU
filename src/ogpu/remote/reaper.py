@@ -47,6 +47,28 @@ def last_activity():
         return time.time()
 
 
+def container_started_at():
+    """Start time of PID 1 (the container's init) — /proc/uptime would be the host's."""
+    try:
+        with open("/proc/1/stat") as f:
+            ticks = int(f.read().rsplit(")", 1)[1].split()[19])
+        with open("/proc/stat") as f:
+            btime = next(int(l.split()[1]) for l in f if l.startswith("btime"))
+        return btime + ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, StopIteration, IndexError):
+        return None
+
+
+def log_session_end():
+    """Paid time between the last poll and this stop is invisible to the provider API once the pod is down, so
+    record it on the persistent disk; `ogpu` imports it into the ledger on its next connection."""
+    start = container_started_at()
+    if start is None:
+        return
+    with open(f"{OG}/sessions.jsonl", "a") as f:
+        f.write(json.dumps({"pod_id": os.environ.get("RUNPOD_POD_ID"), "start": start, "end": time.time()}) + "\n")
+
+
 def stop_pod():
     pod, key = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
     if pod and key:
@@ -85,6 +107,7 @@ def main():
                 state["stopping"] = True
                 with open(STATE, "w") as f:
                     json.dump(state, f)
+                log_session_end()
                 stop_pod()
                 time.sleep(120)
                 continue

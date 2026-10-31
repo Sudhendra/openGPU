@@ -117,6 +117,7 @@ def up(cfg: Config, console: Console, *, retry_minutes: float = 0, pool: str = "
             console.print(f"[grey50]deleted stuck pod {stuck.id}[/]")
         except RunPodError as e:
             console.print(f"[yellow]could not delete stuck pod {stuck.id}: {e} — remove it in the RunPod console[/]")
+    import_pod_sessions(st, cfg)
     install_helpers(st, cfg)
     console.print(f"[green]✔[/] ready  [magenta]{pool}[/]  [bold]{st.gpu}[/]  root@{st.host}:{st.port}  ${st.cost_per_hr:.2f}/hr  "
                   f"idle-stop {cfg.idle_minutes}m")
@@ -145,6 +146,23 @@ def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minute
             raise SystemExit("no capacity:\n  " + "\n  ".join(errors) + "\n  try `ogpu up --retry 30` to keep polling")
         console.print(f"[yellow]…[/] no capacity (attempt {attempt}); retrying in 30s")
         time.sleep(30)
+
+
+def import_pod_sessions(st: State, cfg: Config) -> None:
+    """Pull session-end records the reaper wrote before stopping (the idle tail the API can't report)."""
+    try:
+        out = ssh.run(st, cfg.private_key_path, f"cat {REMOTE_OGPU}/sessions.jsonl 2>/dev/null && "
+                      f"mv {REMOTE_OGPU}/sessions.jsonl {REMOTE_OGPU}/sessions.imported.$(date +%s)", check=False).stdout
+    except Exception:  # noqa: BLE001
+        return
+    with ledger.connect() as db:
+        for line in out.splitlines():
+            try:
+                rec = json.loads(line)
+                ledger.record_session(db, rec.get("pod_id") or st.pod_id, rec["end"] - rec["start"],
+                                      st.cost_per_hr, start=rec["start"])
+            except (ValueError, KeyError, TypeError):
+                continue
 
 
 def upgrade_helpers(st: State, cfg: Config) -> None:

@@ -73,6 +73,7 @@ def content_key(roots: list[Path], cmd: str, mode: str, image: str) -> str:
 
 SCORE = re.compile(r"^SCORE (\S+): ([\d.]+)")
 CHECK = re.compile(r"^CHECK (\S+) (\S+) (\S+): (PASS|FAIL)")
+ERR = re.compile(r"relative L2 error ([\d.e+-]+)[^\[]*\[bound ([\d.e+-]+)")
 CHECKS = re.compile(r"^CHECKS: (ALL PASS|(\d+) FAIL)")
 SIDE = re.compile(r"^SIDE (\S+): (\{.*\})\s*$")
 METRIC = re.compile(r"^OGPU_METRIC (\w+)=(\S+)")
@@ -89,6 +90,12 @@ def parse_metrics(log: str) -> dict:
         elif r := CHECK.match(line):
             passes += r[4] == "PASS"
             fails += r[4] == "FAIL"
+            for err, bound in ERR.findall(line):  # how close to the judge's bound (1.0 = at the bound)
+                try:
+                    ratio = float(err) / float(bound)
+                except (ValueError, ZeroDivisionError):
+                    continue
+                m["check_margin"] = max(m.get("check_margin", 0.0), round(ratio, 4))
         elif r := CHECKS.match(line):
             m["checks"] = "PASS" if r[1] == "ALL PASS" else "FAIL"
         elif r := SIDE.match(line):
@@ -177,10 +184,11 @@ def record(db: sqlite3.Connection, **row) -> None:
     db.commit()
 
 
-def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_per_hr: float) -> None:
+def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_per_hr: float,
+                   start: float | None = None) -> None:
     """Upsert the current pod session. start ≈ now − uptime jitters by a few seconds between polls, so match any
     session of this pod that started within 2 minutes instead of keying on an exact start."""
-    start = time.time() - uptime_s
+    start = time.time() - uptime_s if start is None else start
     row = db.execute("select start from sessions where pod_id=? and abs(start - ?) < 120 order by abs(start - ?) "
                      "limit 1", (pod_id, start, start)).fetchone()
     if row:

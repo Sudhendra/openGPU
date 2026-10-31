@@ -67,6 +67,9 @@ def down(terminate: bool = typer.Option(False, "--terminate", help="delete the p
     if not p:
         console.print(f"[grey50]no {pool} pod[/]")
         return
+    if p.uptime_s:  # last sample of paid time before the pod goes away
+        with ledger.connect() as db:
+            ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
     if terminate:
         rp.terminate(p.id)
         save_state(State(), pool)

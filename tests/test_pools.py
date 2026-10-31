@@ -20,7 +20,7 @@ def test_pool_config_defaults_and_overrides():
     assert cfg.pool("timing") is cfg
     c = cfg.pool("correctness")
     assert c.pod_name == "ogpu-h200-correctness" and c.idle_minutes == 10
-    assert c.gpu_type_ids[0] == "NVIDIA H100 PCIe" and c.image == cfg.image  # same image, cheaper GPU
+    assert c.gpu_type_ids[0] == "NVIDIA H100 NVL" and c.image == cfg.image  # same image, cheaper GPU
     c2 = config.Config(pools={"correctness": {"gpu_type_ids": ["NVIDIA H100 NVL"], "idle_minutes": 5}}).pool("correctness")
     assert c2.gpu_type_ids == ["NVIDIA H100 NVL"] and c2.idle_minutes == 5
     assert config.Config(pools={"correctness": {"enabled": False}}).pool("correctness") is None
@@ -109,3 +109,25 @@ def test_resume_failure_recreates_then_deletes_stuck_pod(home, monkeypatch):
     with pytest.raises(SystemExit):
         podmod.up(config.Config(recreate_on_resume_failure=False), Console(quiet=True))
     assert events == [("resume", "stuck")]
+
+
+def test_check_margin_parsed_from_judge_lines():
+    from ogpu import ledger
+    log = ("CHECK d1f s.py judge: PASS update relative L2 error 4.780e-03 (worst row 4.780e-03) [bound 0.070]; "
+           "attention input relative L2 error 3.850e-03 (worst row 3.850e-03) [bound 0.070]\n"
+           "CHECK v1f best.py judge: PASS relative L2 error 2.976e-02 (worst row 3.1e-02) [bound 0.064: 2.5 x the ...]\n")
+    m = ledger.parse_metrics(log)
+    assert m["check_margin"] == round(2.976e-02 / 0.064, 4)  # worst ratio across all checks/terms
+    assert m["checks"] == "PASS"
+
+
+def test_session_with_explicit_start_merges_with_polled_samples(tmp_path):
+    import time as _t
+    from ogpu import ledger
+    db = ledger.connect(tmp_path / "l.db")
+    start = _t.time() - 3600
+    ledger.record_session(db, "pod", 1800, 4.0)                  # polled mid-session (start ≈ now-1800)
+    ledger.record_session(db, "pod", 3600, 4.0, start=start)     # reaper's end-of-session record for an earlier start
+    ledger.record_session(db, "pod", 3590, 4.0, start=start + 5)  # same session seen again: merged, not doubled
+    rows = db.execute("select count(*) n, sum(uptime_s) u from sessions").fetchone()
+    assert rows["n"] == 2 and rows["u"] == 1800 + 3600

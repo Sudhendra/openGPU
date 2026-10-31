@@ -37,12 +37,13 @@ recreate_on_resume_failure = true      # stopped pod's host has no free GPU → 
 
 # Pools: the settings above are the `timing` pool. Other pools override any of them.
 [pools.correctness]                    # `--fidelity correctness` jobs: cheap GPUs with the same ISA (sm_90a, like H200)
-gpu_type_ids = ["NVIDIA H100 PCIe", "NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3"]
+# 132-SM parts first (same SM count as H200 → same launch configs); 114-SM PCIe last
+gpu_type_ids = ["NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"]
 idle_minutes = 10
 """
 
 POOLS = ("timing", "correctness")
-DEFAULT_POOLS = {"correctness": {"gpu_type_ids": ["NVIDIA H100 PCIe", "NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3"],
+DEFAULT_POOLS = {"correctness": {"gpu_type_ids": ["NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
                                  "idle_minutes": 10}}
 
 

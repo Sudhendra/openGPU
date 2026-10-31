@@ -20,7 +20,8 @@ from .config import HOME, LOG_DIR, REMOTE_OGPU, REMOTE_ROOT, Config, State, load
 
 JOBRUN = f"python3 {REMOTE_OGPU}/bin/jobrun.py"
 RESULT_KEYS = ("id", "status", "failure", "error", "exit_code", "wall_s", "cost_usd", "metrics", "note", "pool",
-               "log_path", "cached_from")
+               "confirm_on_timing", "advice", "log_path", "cached_from")
+NEAR_BOUND = 0.8  # correctness-pool passes above this fraction of the bound get re-confirmed on the timing pool
 
 
 def remote_dir(local: Path) -> str:
@@ -187,13 +188,32 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
         prev_best = ledger.track_best(db, row["track"], exclude_id=jid)
         ledger.update(db, jid, status=status, exit_code=rc, started=started, ended=ended or time.time(), wall_s=wall,
                       cost_usd=wall / 3600 * st.cost_per_hr, metrics=metrics, failure=failure, error=error)
+        record_uptime(st, db)
         r = as_result(ledger.get(db, jid))
+        if pool != "timing" and not failure and metrics.get("check_margin", 0) > NEAR_BOUND:
+            # measured: an H100 shifts error values by up to ~17% of the bound vs the H200
+            r["confirm_on_timing"] = True
+            r["advice"] = (f"checks passed on the {pool} pool but the worst error is at "
+                           f"{metrics['check_margin']:.0%} of the bound — confirm with --fidelity timing")
         b = ledger.best_score(metrics)
         if not failure and b is not None and (prev_best is None or b > prev_best):
             r["new_best"] = True
             notify.send("ogpu · new best", f"{row['track']}: {b:.4f}× ({row['agent']})"
                         + (f" — was {prev_best:.4f}×" if prev_best else ""))
         return r
+
+
+def record_uptime(st: State, db) -> None:
+    """Paid time comes from the provider's uptime; sample it after every job so spend (and the budget cap) never
+    depends on someone running `status` or `top`. Best effort: never fails a job."""
+    if not st.pod_id:
+        return
+    try:
+        p = pod.client().pod(st.pod_id)
+        if p and p.uptime_s:
+            ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def wait(cfg: Config, console: Console, jid: str, *, stream: bool, retry_lost: int = 1) -> dict:
