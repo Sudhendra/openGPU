@@ -30,7 +30,8 @@ create table if not exists sessions (
 
 # columns added after v0; connect() adds them to existing ledgers
 EXTRA_COLUMNS = {"track_path": "text", "note": "text", "failure": "text", "error": "text", "timeout_s": "real",
-                 "submitted": "real", "extra_paths": "text"}
+                 "submitted": "real", "extra_paths": "text",
+                 "pool": "text"}
 
 
 def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:

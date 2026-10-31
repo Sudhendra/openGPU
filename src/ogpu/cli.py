@@ -29,54 +29,83 @@ MODAL_RATE = {"H200": float(os.environ.get("OGPU_MODAL_H200_HR", 4.54)),
               "H100": float(os.environ.get("OGPU_MODAL_H100_HR", 3.95)), "none": 0.35}
 
 
+POOL_OPT = typer.Option("timing", "--pool", "-p", help="timing (target GPU) or correctness (cheap same-ISA GPU)")
+
+
+def _pool_cfg(pool: str):
+    from .config import POOLS
+    if pool not in POOLS:
+        raise typer.BadParameter(f"unknown pool {pool!r} (choose from {', '.join(POOLS)})")
+    pcfg = load_config().pool(pool)
+    if pcfg is None:
+        raise SystemExit(f"pool {pool!r} is disabled in {CONFIG_PATH}")
+    return pcfg
+
+
 @app.command()
-def up(retry: float = typer.Option(0, help="keep retrying for capacity this many minutes")):
-    """Reuse, resume, or create the H200 pod and wait until SSH works."""
+def up(retry: float = typer.Option(0, help="keep retrying for capacity this many minutes"), pool: str = POOL_OPT):
+    """Reuse, resume, or create the pool's pod and wait until SSH works."""
+    import fcntl
+
     from . import pod
-    pod.up(load_config(), console, retry_minutes=retry)
+    from .config import HOME
+    pcfg = _pool_cfg(pool)
+    lock_name = "up.lock" if pool == "timing" else f"up-{pool}.lock"
+    with open(HOME / lock_name, "w") as lk:  # same lock as auto-up and background warm-up
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        pod.up(pcfg, console, retry_minutes=retry, pool=pool)
 
 
 @app.command()
-def down(terminate: bool = typer.Option(False, "--terminate", help="delete the pod and its disk (not just stop)")):
-    """Stop the pod now (disk + caches kept). --terminate deletes it."""
+def down(terminate: bool = typer.Option(False, "--terminate", help="delete the pod and its disk (not just stop)"),
+         pool: str = POOL_OPT):
+    """Stop the pool's pod now (disk + caches kept). --terminate deletes it."""
     from . import pod
     from .config import State, save_state
     rp = pod.client()
-    p = pod.current(rp, load_config())
+    p = pod.current(rp, _pool_cfg(pool), pool)
     if not p:
-        console.print("[grey50]no pod[/]")
+        console.print(f"[grey50]no {pool} pod[/]")
         return
     if terminate:
         rp.terminate(p.id)
-        save_state(State())
-        console.print(f"[red]✘[/] terminated {p.id}")
+        save_state(State(), pool)
+        console.print(f"[red]✘[/] terminated {pool} pod {p.id}")
     else:
         rp.stop(p.id)
-        console.print(f"[yellow]■[/] stopped {p.id} — `ogpu up` resumes it")
+        console.print(f"[yellow]■[/] stopped {pool} pod {p.id} — `ogpu up --pool {pool}` resumes it")
 
 
 @app.command()
 def status(as_json: bool = typer.Option(False, "--json")):
-    """Pod state, price, uptime, and today's spend."""
+    """Every pool's pod: state, price, uptime; plus today's spend."""
     from . import pod
+    from .config import POOLS
     cfg = load_config()
-    p = pod.current(pod.client(), cfg)
+    rp = pod.client()
+    pods = {}
     with ledger.connect() as db:
-        if p and p.uptime_s:
-            ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
+        for name in POOLS:
+            pcfg = cfg.pool(name)
+            p = pod.current(rp, pcfg, name) if pcfg else None
+            if p:
+                if p.uptime_s:
+                    ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
+                pod.sync_state(p, pool=name)
+            pods[name] = p
         today = ledger.spend(db, ledger.today_start())
-    if p:
-        pod.sync_state(p)
-    d = {"pod": p.__dict__ if p else None, "today_usd": round(today, 2), "budget_usd": cfg.budget_usd}
     if as_json:
-        print(json.dumps(d))
+        print(json.dumps({"pods": {n: (p.__dict__ if p else None) for n, p in pods.items()},
+                          "pod": pods["timing"].__dict__ if pods.get("timing") else None,
+                          "today_usd": round(today, 2), "budget_usd": cfg.budget_usd}))
         return
-    if not p:
-        console.print("[grey50]no pod — `ogpu up`[/]")
-    else:
+    for name, p in pods.items():
+        if not p:
+            console.print(f"[grey50]○ {name:<11} no pod[/]")
+            continue
         color = {"RUNNING": "green", "EXITED": "yellow"}.get(p.status, "red")
-        console.print(f"[{color}]●[/] [bold]{p.id}[/] {p.status} · {p.gpu} · ${p.cost_per_hr:.2f}/hr · "
-                      f"up {runner.fmt_dur(p.uptime_s or 0)} · ssh root@{p.ssh_host}:{p.ssh_port}")
+        console.print(f"[{color}]●[/] [magenta]{name:<11}[/] [bold]{p.id}[/] {p.status} · {p.gpu} · "
+                      f"${p.cost_per_hr:.2f}/hr · up {runner.fmt_dur(p.uptime_s or 0)} · ssh root@{p.ssh_host}:{p.ssh_port}")
     console.print(f"  today ${today:.2f} / ${cfg.budget_usd:.0f} cap")
 
 
@@ -87,6 +116,20 @@ WITH_OPT = typer.Option([], "--with", "-w", help="extra dirs to sync next to the
 FORCE_OPT = typer.Option(False, "--force", "-f", help="ignore the content-hash cache")
 NOTE_OPT = typer.Option("", "--note", "-m", help="hypothesis / what changed (stored in the shared ledger)")
 TIMEOUT_OPT = typer.Option(None, "--timeout", help="kill the job after this many seconds (exit 124)")
+FIDELITY_OPT = typer.Option("timing", "--fidelity", help="timing: run on the target GPU (H200). correctness: may run on "
+                            "the cheaper same-ISA pool (H100) — use for --check / numerics, never for timings you trust")
+
+
+def _fidelity(f: str) -> str:
+    if f not in ("timing", "correctness"):
+        raise typer.BadParameter("--fidelity must be timing or correctness")
+    return f
+
+
+def _job_pool(job_id: str) -> str:
+    with ledger.connect() as db:
+        row = ledger.get(db, job_id)
+    return (row["pool"] if row and row["pool"] else "timing")
 
 
 def _command(cmd: list[str]) -> str:
@@ -96,26 +139,29 @@ def _command(cmd: list[str]) -> str:
 @app.command(context_settings={"allow_interspersed_args": False})
 def run(cmd: list[str] = CMD_ARG, gpu: bool = GPU_OPT, track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT,
         force: bool = FORCE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
-        as_json: bool = typer.Option(False, "--json", help="machine output for agents (one JSON line)"),
+        fidelity: str = FIDELITY_OPT, as_json: bool = typer.Option(False, "--json", help="machine output for agents (one JSON line)"),
         quiet: bool = typer.Option(False, "--quiet", "-q", help="don't stream the log")):
     """Sync the track, run CMD on the pod (GPU-locked or CPU-parallel), stream the log, record the result.
 
     Exit code: the job's own, 2 = daily budget cap hit, 3 = benchmark passed but correctness checks FAILED."""
     rc = runner.run(load_config(), track=track, extra=with_, cmd=_command(cmd), mode="gpu" if gpu else "cpu",
-                    force=force, as_json=as_json, quiet=quiet, note=note, timeout_s=timeout)
+                    force=force, as_json=as_json, quiet=quiet, note=note, timeout_s=timeout,
+                    fidelity=_fidelity(fidelity))
     raise typer.Exit(rc)
 
 
 @app.command(context_settings={"allow_interspersed_args": False})
 def submit(cmd: list[str] = CMD_ARG, gpu: bool = GPU_OPT, track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT,
-           force: bool = FORCE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT):
+           force: bool = FORCE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
+           fidelity: str = FIDELITY_OPT):
     """Queue CMD and return immediately with its id (JSON). Collect with `ogpu wait <id>...`.
 
     A cache hit returns the finished result right away (status done/failed)."""
     con = Console(stderr=True)
     try:
         r = runner.submit(load_config(), con, track=track, extra=with_, cmd=_command(cmd),
-                          mode="gpu" if gpu else "cpu", force=force, note=note, timeout_s=timeout)
+                          mode="gpu" if gpu else "cpu", force=force, note=note, timeout_s=timeout,
+                          fidelity=_fidelity(fidelity))
     except runner.BudgetExceeded as e:
         print(json.dumps({"status": "budget_exceeded", "error": e.msg}))
         raise typer.Exit(2)
@@ -144,10 +190,11 @@ def wait(ids: list[str] = typer.Argument(..., help="job ids from `ogpu submit`")
 
 
 @app.command()
-def top():
+def top(pool: str = POOL_OPT):
     """Live dashboard: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdown."""
     from .tui import run_top
-    run_top(load_config())
+    _pool_cfg(pool)
+    run_top(load_config(), pool)
 
 
 @app.command()
@@ -156,16 +203,18 @@ def logs(job_id: str, follow: bool = typer.Option(False, "--follow", "-f")):
     cfg = load_config()
     local = LOG_DIR / f"{job_id}.log"
     if follow:
-        st = load_state()
+        pool = _job_pool(job_id)
         tmp = LOG_DIR / f"{job_id}.follow.log"
         tmp.unlink(missing_ok=True)
-        status, rc, *_ = runner.poll_loop(console, st, cfg.private_key_path, job_id, tmp, stream=True)
+        status, rc, *_ = runner.poll_loop(console, load_state(pool), cfg.private_key_path, job_id, tmp, stream=True,
+                                          pool=pool)
         console.print(f"[bold]{status}[/] exit {rc}")
         return
     if local.exists():
         sys.stdout.write(local.read_text(errors="replace"))
         return
-    p = ssh.run(load_state(), cfg.private_key_path, f"cat /workspace/.ogpu/jobs/{shlex.quote(job_id)}.log", check=False)
+    p = ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path,
+                f"cat /workspace/.ogpu/jobs/{shlex.quote(job_id)}.log", check=False)
     sys.stdout.write(p.stdout or p.stderr)
 
 
@@ -173,7 +222,7 @@ def logs(job_id: str, follow: bool = typer.Option(False, "--follow", "-f")):
 def cancel(job_id: str):
     """Kill a queued or running job on the pod."""
     cfg = load_config()
-    ssh.run(load_state(), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
+    ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
     console.print(f"[yellow]■[/] cancelled {job_id}")
 
 

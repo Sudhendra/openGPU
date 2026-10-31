@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tomllib
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 HOME = Path(os.environ.get("OGPU_HOME", Path.home() / ".ogpu"))
@@ -33,7 +33,17 @@ idle_minutes = 20                      # on-pod reaper stops the pod after this 
 budget_usd = 60.0                      # daily cap: `ogpu run --gpu` refuses new work beyond it
 auto_up = true                         # `ogpu run` resumes/creates the pod if it is not running
 quiet_timing = true                    # CPU jobs run niced on non-reserved cores so they can't disturb GPU timings
+recreate_on_resume_failure = true      # stopped pod's host has no free GPU → create a new pod instead of failing
+
+# Pools: the settings above are the `timing` pool. Other pools override any of them.
+[pools.correctness]                    # `--fidelity correctness` jobs: cheap GPUs with the same ISA (sm_90a, like H200)
+gpu_type_ids = ["NVIDIA H100 PCIe", "NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3"]
+idle_minutes = 10
 """
+
+POOLS = ("timing", "correctness")
+DEFAULT_POOLS = {"correctness": {"gpu_type_ids": ["NVIDIA H100 PCIe", "NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3"],
+                                 "idle_minutes": 10}}
 
 
 @dataclass
@@ -53,6 +63,19 @@ class Config:
     budget_usd: float = 60.0
     auto_up: bool = True
     quiet_timing: bool = True
+    recreate_on_resume_failure: bool = True
+    pools: dict = field(default_factory=dict)
+
+    def pool(self, name: str) -> "Config | None":
+        """The config for one pool: `timing` is the top level; others override it. None if disabled."""
+        if name == "timing":
+            return self
+        over = dict(DEFAULT_POOLS.get(name, {})) | dict(self.pools.get(name, {}))
+        if not over or over.pop("enabled", True) is False:
+            return None
+        known = Config.__dataclass_fields__
+        over.setdefault("pod_name", f"{self.pod_name}-{name}")
+        return replace(self, **{k: v for k, v in over.items() if k in known and k != "pools"})
 
     @property
     def public_key(self) -> str:
@@ -93,13 +116,22 @@ class State:
         return bool(self.host and self.port)
 
 
-def load_state() -> State:
+def _read_states() -> dict:
     if not STATE_PATH.exists():
-        return State()
+        return {}
+    raw = json.loads(STATE_PATH.read_text())
+    return raw.get("pools", {}) if "pools" in raw else {"timing": raw}  # pre-pool state files = timing pool
+
+
+def load_state(pool: str = "timing") -> State:
     known = State.__dataclass_fields__
-    return State(**{k: v for k, v in json.loads(STATE_PATH.read_text()).items() if k in known})
+    return State(**{k: v for k, v in _read_states().get(pool, {}).items() if k in known})
 
 
-def save_state(s: State) -> None:
+def save_state(s: State, pool: str = "timing") -> None:
     HOME.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(asdict(s), indent=1))
+    states = _read_states()
+    states[pool] = asdict(s)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"pools": states}, indent=1))
+    tmp.replace(STATE_PATH)

@@ -1,4 +1,4 @@
-"""Pod lifecycle: get a reachable H200 (reuse → resume → create with fallbacks), install the remote helpers."""
+"""Pod lifecycle per pool: get a reachable GPU pod (reuse → resume → create with fallbacks), install the helpers."""
 from __future__ import annotations
 
 import fcntl
@@ -22,8 +22,8 @@ def client() -> RunPod:
     return RunPod(api_key())
 
 
-def current(rp: RunPod, cfg: Config) -> Pod | None:
-    st = load_state()
+def current(rp: RunPod, cfg: Config, pool: str = "timing") -> Pod | None:
+    st = load_state(pool)
     pod = None
     if st.pod_id:
         try:
@@ -33,11 +33,11 @@ def current(rp: RunPod, cfg: Config) -> Pod | None:
     return pod or rp.find(cfg.pod_name)
 
 
-def sync_state(pod: Pod, cloud: str = "") -> State:
-    st = load_state()
+def sync_state(pod: Pod, cloud: str = "", pool: str = "timing") -> State:
+    st = load_state(pool)
     st = State(pod_id=pod.id, host=pod.ssh_host, port=pod.ssh_port, cost_per_hr=pod.cost_per_hr,
                gpu=pod.gpu or st.gpu, cloud=cloud or st.cloud)
-    save_state(st)
+    save_state(st, pool)
     if pod.uptime_s:
         with ledger.connect() as db:
             ledger.record_session(db, pod.id, pod.uptime_s, pod.cost_per_hr)
@@ -69,7 +69,8 @@ def install_helpers(st: State, cfg: Config) -> None:
     ssh.run(st, key, "\n".join(script), timeout=60)
 
 
-def wait_reachable(rp: RunPod, pod_id: str, cfg: Config, console: Console, timeout_s: int = 900) -> State:
+def wait_reachable(rp: RunPod, pod_id: str, cfg: Config, console: Console, timeout_s: int = 900,
+                   pool: str = "timing") -> State:
     t0 = time.time()
     with console.status("[cyan]booting pod · waiting for public SSH…") as s:
         while time.time() - t0 < timeout_s:
@@ -79,7 +80,7 @@ def wait_reachable(rp: RunPod, pod_id: str, cfg: Config, console: Console, timeo
                 time.sleep(5)
                 continue
             if pod and pod.ssh_port:
-                st = sync_state(pod)
+                st = sync_state(pod, pool=pool)
                 err = f" · [red]{ssh.last_error}[/]" if ssh.last_error and time.time() - t0 > 60 else ""
                 s.update(f"[cyan]pod up at {st.host}:{st.port} · waiting for sshd (first boot installs it)…{err}")
                 if ssh.reachable(st, cfg.private_key_path):
@@ -88,28 +89,41 @@ def wait_reachable(rp: RunPod, pod_id: str, cfg: Config, console: Console, timeo
     raise SystemExit(f"pod {pod_id} did not become reachable in {timeout_s}s — check the RunPod console logs")
 
 
-def up(cfg: Config, console: Console, *, retry_minutes: float = 0) -> State:
+def up(cfg: Config, console: Console, *, retry_minutes: float = 0, pool: str = "timing") -> State:
+    """`cfg` is the pool's config (Config.pool(name))."""
     rp = client()
-    pod = current(rp, cfg)
+    pod = current(rp, cfg, pool)
     if pod and pod.status == "RUNNING":
         console.print(f"[green]●[/] reusing running pod [bold]{pod.id}[/] ({pod.gpu or 'GPU'}, ${pod.cost_per_hr:.2f}/hr)")
-    elif pod:
+    stuck = None
+    if pod and pod.status != "RUNNING":
         console.print(f"[yellow]●[/] resuming stopped pod [bold]{pod.id}[/] (disk + caches preserved)…")
         try:
             rp.resume(pod.id)
         except RunPodError as e:
-            raise SystemExit(f"resume failed: {e}\n  The host may have no free H200 right now. Retry, or "
-                             f"`ogpu down --terminate` and `ogpu up` to land on a new machine (loses the pod disk).")
-    else:
-        pod = create_with_fallback(rp, cfg, console, retry_minutes)
-    st = wait_reachable(rp, pod.id, cfg, console)
+            if not cfg.recreate_on_resume_failure:
+                raise SystemExit(f"resume failed: {e}\n  The host may have no free GPU right now. Retry, or "
+                                 f"`ogpu down --terminate` and `ogpu up` to land on a new machine (loses the pod disk).")
+            # the host's GPU was rented while we were stopped: move to a new machine rather than fail the job
+            console.print(f"[yellow]↻[/] resume failed ({e}) — creating a new {pool} pod; "
+                          f"the stuck one is deleted once the new one is up (only caches are lost)")
+            stuck, pod = pod, None
+    if pod is None:
+        pod = create_with_fallback(rp, cfg, console, retry_minutes, pool)
+    st = wait_reachable(rp, pod.id, cfg, console, pool=pool)
+    if stuck is not None:
+        try:
+            rp.terminate(stuck.id)
+            console.print(f"[grey50]deleted stuck pod {stuck.id}[/]")
+        except RunPodError as e:
+            console.print(f"[yellow]could not delete stuck pod {stuck.id}: {e} — remove it in the RunPod console[/]")
     install_helpers(st, cfg)
-    console.print(f"[green]✔[/] ready  [bold]{st.gpu}[/]  root@{st.host}:{st.port}  ${st.cost_per_hr:.2f}/hr  "
+    console.print(f"[green]✔[/] ready  [magenta]{pool}[/]  [bold]{st.gpu}[/]  root@{st.host}:{st.port}  ${st.cost_per_hr:.2f}/hr  "
                   f"idle-stop {cfg.idle_minutes}m")
     return st
 
 
-def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minutes: float) -> Pod:
+def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minutes: float, pool: str = "timing") -> Pod:
     deadline = time.time() + retry_minutes * 60
     attempt = 0
     while True:
@@ -123,7 +137,7 @@ def create_with_fallback(rp: RunPod, cfg: Config, console: Console, retry_minute
                                     network_volume_id=cfg.network_volume_id, public_key=cfg.public_key,
                                     min_vcpu=cfg.min_vcpu, min_memory_gb=cfg.min_memory_gb)
                     console.print(f"[green]✔[/] created pod [bold]{pod.id}[/] · {gpu} · {cloud.lower()} cloud")
-                    sync_state(pod, cloud=cloud.lower())
+                    sync_state(pod, cloud=cloud.lower(), pool=pool)
                     return pod
                 except RunPodError as e:
                     errors.append(f"{gpu}/{cloud.lower()}: {e}")
@@ -143,18 +157,20 @@ def upgrade_helpers(st: State, cfg: Config) -> None:
         install_helpers(st, cfg)
 
 
-def ensure(cfg: Config, console: Console) -> State:
-    """Fast path for `ogpu run`: trust state.json if SSH answers; otherwise bring the pod up (if auto_up)."""
-    st = load_state()
+def ensure(cfg: Config, console: Console, pool: str = "timing") -> State:
+    """Fast path for `ogpu run`: trust the pool's state if SSH answers; otherwise bring its pod up (if auto_up).
+    `cfg` is the pool's config."""
+    st = load_state(pool)
     if ssh.reachable(st, cfg.private_key_path):
         upgrade_helpers(st, cfg)
         return st
     if not cfg.auto_up:
-        raise SystemExit("pod not reachable; run `ogpu up` (or set auto_up = true)")
+        raise SystemExit(f"{pool} pod not reachable; run `ogpu up --pool {pool}` (or set auto_up = true)")
     # several agents may hit a stopped pod at once: only one brings it up, the rest reuse the result
-    with open(HOME / "up.lock", "w") as lk:
+    lock_name = "up.lock" if pool == "timing" else f"up-{pool}.lock"
+    with open(HOME / lock_name, "w") as lk:
         fcntl.flock(lk, fcntl.LOCK_EX)
-        st = load_state()
+        st = load_state(pool)
         if ssh.reachable(st, cfg.private_key_path):
             return st
-        return up(cfg, console)
+        return up(cfg, console, pool=pool)

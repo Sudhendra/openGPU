@@ -45,8 +45,9 @@ def short(cmd: str, n: int = 52) -> str:
 class Poller:
     """Background refresh of the job snapshot (SSH) and pod info (RunPod API)."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, pool: str = "timing"):
         self.cfg = cfg
+        self.pool = pool
         self.snap: dict | None = None
         self.pod = None
         self.err = ""
@@ -57,7 +58,7 @@ class Poller:
     def _snap_loop(self):
         while not self._stop:
             try:
-                st = load_state()
+                st = load_state(self.pool)
                 p = ssh.run(st, self.cfg.private_key_path, f"{JOBRUN} snapshot", timeout=20)
                 self.snap, self.err = json.loads(p.stdout), ""
             except Exception as e:  # noqa: BLE001 — keep the dashboard alive on any transient failure
@@ -71,10 +72,10 @@ class Poller:
         rp = client()
         while not self._stop:
             try:
-                st = load_state()
+                st = load_state(self.pool)
                 self.pod = rp.pod(st.pod_id) if st.pod_id else None
                 if self.pod:
-                    sync_state(self.pod)
+                    sync_state(self.pod, pool=self.pool)
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(15)
@@ -84,7 +85,9 @@ class Poller:
 
 
 def render(cfg: Config, tel: Telemetry, poll: Poller, width: int) -> Group:
-    st = load_state()
+    pool = poll.pool
+    st = load_state(pool)
+    pcfg = cfg.pool(pool) or cfg
     now = time.time()
     rows: list = []
 
@@ -95,7 +98,7 @@ def render(cfg: Config, tel: Telemetry, poll: Poller, width: int) -> Group:
     with ledger.connect() as db:
         today = ledger.spend(db, ledger.today_start())
     cap_style = "red" if today >= cfg.budget_usd else "yellow" if today >= 0.8 * cfg.budget_usd else "green"
-    h = Text() + Text(" ogpu ", style="bold black on bright_magenta") + Text(f" {cfg.pod_name} ", style="bold")
+    h = Text() + Text(" ogpu ", style="bold black on bright_magenta") + Text(f" {pcfg.pod_name} ", style="bold") + Text(f"[{pool}] ", style="magenta")
     h += Text(f" {status} ", style=STATUS_STYLE.get(status, "bold black on grey50"))
     h += Text(f"  runpod/{st.cloud or '?'}  ", style="grey70") + Text(f"${st.cost_per_hr:.2f}/hr", style="bold cyan")
     h += Text(f"  up {up}  ", style="grey70") + Text("today ", style="grey70")
@@ -201,13 +204,13 @@ def render(cfg: Config, tel: Telemetry, poll: Poller, width: int) -> Group:
     return Group(*rows)
 
 
-def run_top(cfg: Config) -> None:
+def run_top(cfg: Config, pool: str = "timing") -> None:
     console = Console()
-    st = load_state()
+    st = load_state(pool)
     if not st.reachable:
-        raise SystemExit("no pod recorded yet — run `ogpu up` first")
+        raise SystemExit(f"no {pool} pod recorded yet — run `ogpu up --pool {pool}` first")
     tel = Telemetry(ssh.ssh_argv(st, cfg.private_key_path, SMI))
-    poll = Poller(cfg)
+    poll = Poller(cfg, pool)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd) if sys.stdin.isatty() else None
     try:
@@ -226,7 +229,7 @@ def run_top(cfg: Config) -> None:
                 if key == "s":
                     if confirm_stop:
                         from .pod import client
-                        client().stop(load_state().pod_id)
+                        client().stop(load_state(pool).pod_id)
                         confirm_stop = False
                     else:
                         confirm_stop = True
