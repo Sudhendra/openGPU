@@ -110,3 +110,34 @@ def test_reaper_tick_survives_errors_and_writes_heartbeat(tmp_path, monkeypatch)
     assert rp.tick(123.0) == 15
     st = json.loads((tmp_path / "reaper.json").read_text())
     assert st["busy"] and st["checked"] == 123.0 and "pid" in st
+
+
+def test_correctness_submit_failure_falls_back_to_timing(monkeypatch, tmp_path):
+    """Oct 31: the new H100 pod's volume refused `cp -a`, so every sweep correctness stage crashed with a traceback.
+    A cheap pod that can't start a job must hand the job to the timing pod instead."""
+    import subprocess
+    from rich.console import Console
+    from ogpu import runner, ledger
+    monkeypatch.setattr(runner, "HOME", tmp_path)
+    monkeypatch.setattr(runner, "choose_pool", lambda cfg, con, mode, fid: "correctness")
+    real = ledger.connect
+    monkeypatch.setattr(ledger, "connect", lambda *a, **k: real(tmp_path / "l.db"))
+    tried = []
+
+    def fake_push_and_start(cfg, con, pool, *a):
+        tried.append(pool)
+        if pool == "correctness":
+            raise subprocess.CalledProcessError(1, ["ssh"], stderr="cp: preserving permissions: Operation not permitted\n")
+
+    monkeypatch.setattr(runner, "push_and_start", fake_push_and_start)
+    (tmp_path / "t").mkdir()
+    r = runner.submit(config.Config(budget_usd=1e9), Console(quiet=True), track=tmp_path / "t", extra=[], cmd="x",
+                      mode="gpu", force=True, fidelity="correctness")
+    assert tried == ["correctness", "timing"] and r["status"] == "queued"
+    row = real(tmp_path / "l.db").execute("select pool from runs where id=?", (r["id"],)).fetchone()
+    assert row[0] == "timing"
+
+
+def test_snapshot_copy_tolerates_volumes_without_chmod():
+    src = (REMOTE / "jobrun.py").read_text()
+    assert '"cp", "-a"' not in src and '"cp", "-rP"' in src

@@ -102,11 +102,34 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
             notify.once("budget80", "ogpu budget", f"${spent:.2f} of ${cfg.budget_usd:.0f} daily cap used")
 
     pool = choose_pool(cfg, console, mode, fidelity)
+    jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+    timeout_s = timeout_s or cfg.default_timeout_s or None
+    while True:
+        try:
+            push_and_start(cfg, console, pool, jid, agent, track, roots, cmd, mode, key, timeout_s, db)
+            break
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            err = (getattr(e, "stderr", None) or "").strip().splitlines()[-3:]
+            detail = " | ".join(err) or type(e).__name__
+            if pool != "timing":  # a broken cheap pod must never block work: run it on the timing pod instead
+                console.print(f"[yellow]↪[/] could not start the job on the {pool} pod ({detail}) — "
+                              f"running it on the timing pod")
+                pool = "timing"
+                continue
+            raise SystemExit(f"could not start the job on the {pool} pod: {detail}") from None
+    ledger.record(db, id=jid, key=key, agent=agent, track=track.name, cmd=cmd, mode=mode, backend="runpod",
+                  status="queued", exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
+                  log_path=str(LOG_DIR / f"{jid}.log"), cached_from=None, track_path=str(track), note=note,
+                  extra_paths=json.dumps([str(e.resolve()) for e in extra]),
+                  failure=None, error=None, timeout_s=timeout_s, submitted=now, pool=pool)
+    return {"id": jid, "status": "queued"}
+
+
+def push_and_start(cfg: Config, console: Console, pool: str, jid: str, agent: str, track: Path, roots: list,
+                   cmd: str, mode: str, key: str, timeout_s, db) -> None:
     pcfg = cfg.pool(pool)
     st = pod.ensure(pcfg, console, pool)
     k = cfg.private_key_path
-    jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-    timeout_s = timeout_s or cfg.default_timeout_s or None
     spec = {"id": jid, "agent": agent, "track": track.name, "cmd": cmd, "mode": mode, "cwd": remote_dir(track),
             "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing,
             **hang_policy(cfg, db, track.name, cmd, pool)}
@@ -116,12 +139,6 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
         for r in roots:
             ssh.push(st, k, r, remote_dir(r))
         ssh.run(st, k, submit_argv(spec), timeout=120)
-    ledger.record(db, id=jid, key=key, agent=agent, track=track.name, cmd=cmd, mode=mode, backend="runpod",
-                  status="queued", exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
-                  log_path=str(LOG_DIR / f"{jid}.log"), cached_from=None, track_path=str(track), note=note,
-                  extra_paths=json.dumps([str(e.resolve()) for e in extra]),
-                  failure=None, error=None, timeout_s=timeout_s, submitted=now, pool=pool)
-    return {"id": jid, "status": "queued"}
 
 
 def hang_policy(cfg: Config, db, track: str, cmd: str, pool: str) -> dict:

@@ -147,7 +147,9 @@ def cmd_start(spec_b64):
     run_dir = f"{RUNS}/{job['id']}"
     os.makedirs(run_dir)
     for root in job.get("roots") or [job["cwd"]]:
-        subprocess.run(["cp", "-a", root, run_dir + "/"], check=True)
+        # not `cp -a`: some RunPod volumes (NFS-backed runpodfs) refuse chmod/chown, which failed every job there.
+        # -P keeps symlinks as links; plain cp still carries the source's mode bits (exec bits survive).
+        subprocess.run(["cp", "-rP", root, run_dir + "/"], check=True)
     job["cwd"] = f"{run_dir}/{os.path.basename(job['cwd'])}"
     job.update(status="queued", created=time.time(), started=None, ended=None, exit_code=None, runner_pid=None,
                boot=BOOT)
