@@ -1,6 +1,6 @@
 """Where machines come from.
 
-Built in: `runpod`, `vast` (machines with SSH and stop/resume), `ssh` (a host you already have) and `modal`
+Built in: `runpod` (machines with SSH and stop/resume), `ssh` (a host you already have) and `modal`
 (serverless: each job is its own container, so there is no machine to keep up).
 
 Add your own provider without touching ogpu: subclass `Provider` and point the config at it
@@ -19,8 +19,7 @@ from dataclasses import dataclass
 from importlib.metadata import entry_points
 
 SERVERLESS = {"modal"}
-BUILTIN = {"runpod": "ogpu.providers.runpod:RunPod", "vast": "ogpu.providers.vast:Vast",
-           "ssh": "ogpu.providers.ssh:StaticHost"}
+BUILTIN = {"runpod": "ogpu.providers.runpod:RunPod", "ssh": "ogpu.providers.ssh:StaticHost"}
 
 
 class ProviderError(RuntimeError):
@@ -84,8 +83,8 @@ class Provider:
         return []
 
     def reaper_stop(self) -> dict:
-        """How the on-machine reaper stops an idle machine: {"provider": name} uses its built-in API call (runpod,
-        vast); {"stop_cmd": "<shell>"} runs a command instead."""
+        """How the on-machine reaper stops an idle machine: {"provider": name} uses its built-in API call
+        (runpod); {"stop_cmd": "<shell>"} runs a command instead."""
         return {"provider": self.name}
 
 

@@ -16,8 +16,8 @@ LOG_DIR = HOME / "logs"
 REMOTE_OGPU = "/workspace/.ogpu"    # jobs/, runs/, bin/, reaper state
 
 DEFAULT_CONFIG = """\
-# ogpu config. API keys come from the environment (RUNPOD_API_KEY, VAST_API_KEY; Modal uses `modal token`).
-provider = "runpod"          # runpod | vast | modal | ssh | your own under [providers.<name>]
+# ogpu config. API keys come from the environment (RUNPOD_API_KEY; Modal uses `modal token new`).
+provider = "runpod"          # runpod | modal | ssh | your own under [providers.<name>]
 gpu_type_ids = []            # provider-native GPU ids, tried in order ([] = provider default; `ogpu gpus` lists ids)
 image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 idle_minutes = 10            # the machine stops itself after this much idle time

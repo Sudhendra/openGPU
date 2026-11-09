@@ -229,23 +229,26 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
             h = json.loads(row["handle"])
             status, rc, started, ended, last = wait_serverless(console, h, log_path, out_local, stream=stream)
             rate = modal_backend.rate(h["gpu"])
+            billed = last.get("billed_s")
         else:
             st = load_state(pool)
             k = cfg.private_key_path
             status, rc, started, ended, last = poll_loop(console, st, k, jid, log_path, stream=stream, pool=pool)
             if ssh.pull(st, k, f"{REMOTE_OGPU}/runs/{jid}/{row['track']}/out", out_local) and not any(out_local.iterdir()):
                 out_local.rmdir()
-            rate = st.cost_per_hr
+            rate, billed = st.cost_per_hr, None
         log = log_path.read_text(errors="replace")
         metrics = ledger.parse_metrics(log, cfg.profile)
         failure, error = failures.classify(status, rc, log, metrics, hang=last.get("hang"))
+        if last.get("launch_failed"):  # the job never ran: image build, auth or quota, not the user's code
+            failure, error = "launch_error", failures.excerpt(log, 8)
         if status == "lost" and (last.get("runner_signal") or last.get("orphan_killed")):
             error = (error or "") + (f"\nrunner got {last['runner_signal']}" if last.get("runner_signal") else "") + \
                     ("\norphaned job process was killed" if last.get("orphan_killed") else "")
         wall = (ended or time.time()) - (started or time.time()) if started else 0.0
         prev_best = ledger.track_best(db, row["track"], exclude_id=jid)
         ledger.update(db, jid, status=status, exit_code=rc, started=started, ended=ended or time.time(), wall_s=wall,
-                      cost_usd=wall / 3600 * rate, metrics=metrics, failure=failure, error=error)
+                      cost_usd=(billed or wall) / 3600 * rate, metrics=metrics, failure=failure, error=error)
         if not row["handle"]:
             record_uptime(cfg.pool(pool) or cfg, st, db)
         r = as_result(ledger.get(db, jid))
@@ -291,9 +294,9 @@ def wait_serverless(console: Console, h: dict, log_path: Path, out_local: Path, 
     finally:
         spinner.stop()
     tail = launcher_log.read_text(errors="replace")[-4000:] if launcher_log.exists() else ""
-    if not results.exists():
-        log_path.write_text(tail)
-        return "lost", -1, None, time.time(), {}
+    if not results.exists():  # `modal run` itself failed (image build, auth, quota): retrying won't help
+        log_path.write_text(tail or "modal run exited without a result\n")
+        return "failed", 1, None, time.time(), {"launch_failed": True}
     r = (json.loads(results.read_text()) or [{"error": "no result"}])[0]
     if "error" in r:
         log_path.write_text(tail + "\n" + r["error"] + "\n")
@@ -303,10 +306,16 @@ def wait_serverless(console: Console, h: dict, log_path: Path, out_local: Path, 
     if src.is_dir() and any(src.iterdir()):
         shutil.copytree(src, out_local, dirs_exist_ok=True)
     ended = r.get("ended") or results.stat().st_mtime
-    return ("done" if r["rc"] == 0 else "failed"), r["rc"], ended - r["wall_s"], ended, {}
+    return ("done" if r["rc"] == 0 else "failed"), r["rc"], ended - r["wall_s"], ended, \
+        {"billed_s": r.get("billed_s")}
 
 
 def pid_alive(pid) -> bool:
+    try:  # our own child (`ogpu run` launched it): reap it, or its zombie looks alive forever
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return False
+    except (ChildProcessError, TypeError):
+        pass
     try:
         os.kill(pid, 0)
         return True

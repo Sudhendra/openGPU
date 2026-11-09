@@ -276,6 +276,9 @@ def cancel(job_id: str):
             os.killpg(json.loads(row["handle"])["pid"], signal.SIGINT)
         except OSError:
             pass
+        if row["status"] not in ledger.TERMINAL:
+            with ledger.connect() as db:
+                ledger.update(db, job_id, status="cancelled", exit_code=-15, ended=time.time())
     else:
         ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
     console.print(f"[yellow]■[/] cancelled {job_id}")
@@ -437,7 +440,8 @@ def fanout(cmds_file: Path,
             row = {"id": f"m{stamp}-{r['i']}-{uuid.uuid4().hex[:4]}", "key": None, "agent": agent, "track": track.name,
                    "cmd": r["cmd"], "mode": "gpu" if gpu != "none" else "cpu", "backend": "modal",
                    "status": "done" if r["rc"] == 0 else "failed", "exit_code": r["rc"], "started": ended - r["wall_s"],
-                   "ended": ended, "wall_s": r["wall_s"], "cost_usd": r["wall_s"] / 3600 * modal_backend.rate(gpu),
+                   "ended": ended, "wall_s": r["wall_s"],
+                   "cost_usd": r.get("billed_s", r["wall_s"]) / 3600 * modal_backend.rate(gpu),
                    "metrics": ledger.parse_metrics(log, cfg.profile), "log_path": r["log_path"], "cached_from": None}
             ledger.record(db, **row)
             runner.result_line(console, row)

@@ -132,7 +132,7 @@ def log_session_end():
     if start is None:
         return
     with open(f"{OG}/sessions.jsonl", "a") as f:
-        machine = load_cfg().get("machine_id") or os.environ.get("RUNPOD_POD_ID") or os.environ.get("CONTAINER_ID")
+        machine = load_cfg().get("machine_id") or os.environ.get("RUNPOD_POD_ID")
         f.write(json.dumps({"pod_id": machine, "start": start, "end": time.time()}) + "\n")
 
 
@@ -157,19 +157,12 @@ def stop_runpod():
     return http("POST", "https://api.runpod.io/graphql?" + urllib.parse.urlencode({"api_key": key}), key, q)
 
 
-def stop_vast():
-    inst, key = os.environ.get("CONTAINER_ID"), os.environ.get("CONTAINER_API_KEY")  # per-instance key, set by Vast
-    if not (inst and key):
-        return "no CONTAINER_ID/CONTAINER_API_KEY"
-    return http("PUT", f"https://console.vast.ai/api/v0/instances/{int(inst)}/", key, {"state": "stopped"})
-
-
 def stop_pod():
     cfg = load_cfg()
     if cfg.get("stop_cmd"):
         out = subprocess.run(["bash", "-c", cfg["stop_cmd"]], capture_output=True, text=True).returncode
     else:
-        stop = {"runpod": stop_runpod, "vast": stop_vast}.get(cfg.get("provider", "runpod"))
+        stop = {"runpod": stop_runpod}.get(cfg.get("provider", "runpod"))
         out = stop() if stop else f"provider {cfg.get('provider')!r} has no self-stop; set stop_cmd"
     print(time.ctime(), "stopping machine:", out, flush=True)
 

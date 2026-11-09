@@ -11,7 +11,6 @@ import pytest
 from rich.console import Console
 
 from ogpu import config, ledger, providers, runner, ssh
-from ogpu.providers import vast
 from test_core import fake_pod, wait_status  # noqa: F401 — reuse the local on-machine runner fixture
 
 REMOTE = Path(__file__).parent.parent / "src/ogpu/remote"
@@ -24,7 +23,6 @@ class MyCloud(providers.Provider):  # a user's own provider, loaded through [pro
 def test_load_builtin_custom_and_unknown_providers():
     cfg = config.Config()
     assert providers.load("runpod", cfg).name == "runpod"
-    assert providers.load("vast", cfg).name == "vast"
     custom = providers.load("mycloud", config.Config(providers={"mycloud": {"module": "test_providers:MyCloud",
                                                                             "region": "x"}}))
     assert isinstance(custom, MyCloud) and custom.opts == {"region": "x"}
@@ -40,26 +38,6 @@ def test_static_ssh_host_provider():
     m = p.create(config.Config(), "", "")
     assert (m.ssh_host, m.ssh_port, m.ssh_user, m.status, m.cost_per_hr) == ("10.0.0.5", 2200, "me", "RUNNING", 0.4)
     assert p.reaper_stop() == {"provider": "ssh", "stop_cmd": "true"}
-
-
-def test_vast_instance_parse():
-    d = {"id": 42, "label": "ogpu", "intended_status": "running", "actual_status": "running", "dph_total": 1.87,
-         "gpu_name": "H100 SXM", "public_ipaddr": "198.51.100.7\n", "ports": {"22/tcp": [{"HostPort": "41022"}]},
-         "start_date": time.time() - 60}
-    m = vast.machine(d)
-    assert (m.id, m.status, m.ssh_host, m.ssh_port, m.cost_per_hr) == ("42", "RUNNING", "198.51.100.7", 41022, 1.87)
-    assert 55 < m.uptime_s < 70
-    proxied = vast.machine({"id": 1, "intended_status": "stopped", "actual_status": "exited",
-                            "ssh_host": "ssh4.vast.ai", "ssh_port": 12345})
-    assert (proxied.status, proxied.ssh_host, proxied.ssh_port, proxied.uptime_s) == ("EXITED", "ssh4.vast.ai", 12345,
-                                                                                      None)
-
-
-def test_vast_offer_query():
-    q = vast.offer_query(config.Config(min_cuda="12.4"), "H100 SXM", "verified")
-    assert q["gpu_name"] == {"eq": "H100 SXM"} and q["verified"] == {"eq": True}
-    assert q["cuda_max_good"] == {"gte": 12.4} and q["order"] == [["dph_total", "asc"]]
-    assert "verified" not in vast.offer_query(config.Config(), "H100 SXM", "any")
 
 
 def test_config_is_generic_by_default_and_okc_is_a_profile(tmp_path, monkeypatch):
@@ -152,12 +130,6 @@ def test_reaper_stops_through_the_configured_provider(monkeypatch):
     rp = load("reaper_stop_test", REMOTE / "reaper.py")
     calls = []
     monkeypatch.setattr(rp, "http", lambda method, url, key, body: calls.append((method, url, key, body)) or b"{}")
-    monkeypatch.setenv("CONTAINER_ID", "42")
-    monkeypatch.setenv("CONTAINER_API_KEY", "scoped")
-    monkeypatch.setattr(rp, "load_cfg", lambda: {"provider": "vast"})
-    rp.stop_pod()
-    assert calls == [("PUT", "https://console.vast.ai/api/v0/instances/42/", "scoped", {"state": "stopped"})]
-    calls.clear()
     monkeypatch.setenv("RUNPOD_POD_ID", "pod1")
     monkeypatch.setenv("RUNPOD_API_KEY", "k")
     monkeypatch.setattr(rp, "load_cfg", lambda: {"provider": "runpod"})
@@ -168,3 +140,13 @@ def test_reaper_stops_through_the_configured_provider(monkeypatch):
     monkeypatch.setattr(rp, "load_cfg", lambda: {"provider": "ssh", "stop_cmd": "sudo shutdown -h now"})
     rp.stop_pod()
     assert ran == [["bash", "-c", "sudo shutdown -h now"]]
+
+
+def test_pid_alive_reaps_own_finished_child():
+    import subprocess
+    p = subprocess.Popen(["true"])
+    time.sleep(0.3)  # exited but not waited on: a zombie, which os.kill(pid, 0) alone reports as alive
+    assert runner.pid_alive(p.pid) is False
+    q = subprocess.Popen(["sleep", "5"])
+    assert runner.pid_alive(q.pid) is True
+    q.kill()

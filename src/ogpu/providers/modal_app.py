@@ -39,6 +39,7 @@ def run(job):
     import tarfile
     import time
 
+    t_container = time.time()  # Modal bills the container (setup + job + teardown), not just the command
     i, cmd = job
     root = os.environ["OGPU_ROOT"]
     subprocess.run(f"rm -rf /root/src && mkdir -p /root/src && cp -r /src/. /root/src/ && mkdir -p {shlex.quote(root)}/out "
@@ -67,7 +68,8 @@ def run(job):
     b = io.BytesIO()
     with tarfile.open(fileobj=b, mode="w:gz") as t:
         t.add(f"{root}/out", arcname="out")
-    return {"i": i, "cmd": cmd, "rc": rc, "wall_s": wall, "gpu": head, "log": "\n".join(lines),
+    return {"i": i, "cmd": cmd, "rc": rc, "wall_s": wall, "billed_s": time.time() - t_container, "gpu": head,
+            "log": "\n".join(lines),
             "out": base64.b64encode(b.getvalue()).decode()}
 
 

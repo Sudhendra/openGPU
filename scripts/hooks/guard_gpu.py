@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Code PreToolUse hook (Bash): block direct GPU-machine access so agents go through `ogpu`.
 
-Blocks raw ssh/scp/rsync to machines and the providers' own CLIs (runpodctl, vastai, `modal run`).
+Blocks raw ssh/scp/rsync to machines and the providers' own CLIs (runpodctl, `modal run`).
 Exit 2 + stderr = the tool call is rejected and the message is shown to the agent.
 """
 import json
@@ -10,9 +10,8 @@ import sys
 
 BLOCK = [
     (re.compile(r"\brunpodctl\b"), "runpodctl"),
-    (re.compile(r"\bvastai\b"), "vastai"),
     (re.compile(r"\bmodal\s+run\b"), "modal run"),
-    (re.compile(r"\b(ssh|scp|sftp)\b[^|;&]*(runpod|vast\.ai|root@\d{1,3}(\.\d{1,3}){3}|-p\s*\d{4,5})"),
+    (re.compile(r"\b(ssh|scp|sftp)\b[^|;&]*(runpod|root@\d{1,3}(\.\d{1,3}){3}|-p\s*\d{4,5})"),
      "direct ssh to a GPU machine"),
     (re.compile(r"\brsync\b[^|;&]*root@"), "direct rsync to a GPU machine"),
 ]

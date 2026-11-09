@@ -1,14 +1,14 @@
 ---
 name: ogpu
-description: Run GPU work (training/eval runs, benchmarks, kernel timing, correctness checks, nvcc/ptxas compile gates, profiling) on shared cloud GPUs through the `ogpu` CLI. Use whenever a task needs a GPU, or would otherwise SSH to a GPU machine or use runpodctl, vastai or `modal run` by hand.
+description: Run GPU work (training/eval runs, benchmarks, kernel timing, correctness checks, nvcc/ptxas compile gates, profiling) on shared cloud GPUs through the `ogpu` CLI. Use whenever a task needs a GPU, or would otherwise SSH to a GPU machine or use runpodctl or `modal run` by hand.
 ---
 
 # ogpu: shared, cost-capped cloud GPUs
 
-Every GPU command goes through `ogpu`. It syncs your working dir to a GPU machine (RunPod, Vast.ai, Modal or the user's own provider), queues GPU jobs behind an exclusive lock so different agents never overlap, records every result in a shared ledger, and stops machines when idle. Other agents may be using the same GPU at the same time as you.
+Every GPU command goes through `ogpu`. It syncs your working dir to a GPU machine (RunPod, Modal or the user's own provider), queues GPU jobs behind an exclusive lock so different agents never overlap, records every result in a shared ledger, and stops machines when idle. Other agents may be using the same GPU at the same time as you.
 
 ## Hard rules
-- **Never** `ssh`/`scp` to a GPU machine, run `runpodctl`/`vastai`, create machines, or call `modal run` directly. Use `ogpu`.
+- **Never** `ssh`/`scp` to a GPU machine, run `runpodctl`, create machines, or call `modal run` directly. Use `ogpu`.
 - **Never** run `ogpu down`, `ogpu down --terminate`, or `ogpu cancel` on a job you didn't start. The idle reaper stops machines for you.
 - **Never** run `ogpu top`. It's an interactive dashboard for the human.
 - Always pass `--json` and read the one-line result. Don't scrape the streamed log for numbers.
@@ -56,7 +56,7 @@ Stages: optional `--compile "<cmd> {file}"` on CPU → correctness of all candid
  "cost_usd": 0.31, "metrics": {"score": 1.083, "loss": 0.412}, "note": "lr 3e-4", "pool": "timing",
  "log_path": "~/.ogpu/logs/1030-164825-d47177.log", "cached_from": null}
 ```
-- `failure`: `null` on a clean pass, else `compile_error`, `import_error`, `correctness_fail`, `oom`, `cuda_error`, `timeout`, `hang`, `runtime_error`, `lost`, `cancelled`. `error` holds the relevant excerpt, so read it instead of the whole log.
+- `failure`: `null` on a clean pass, else `compile_error`, `import_error`, `correctness_fail`, `oom`, `cuda_error`, `timeout`, `hang`, `runtime_error`, `launch_error` (Modal couldn't start the job: image, auth, quota), `lost`, `cancelled`. `error` holds the relevant excerpt, so read it instead of the whole log.
 - `status`: `done` (exit 0), `failed`, `cancelled`, `lost` (the machine restarted mid-job; ogpu already retried once).
 - `metrics`: print `OGPU_METRIC name=value` from your script to add numbers. `score` (higher = better) ranks `ledger --best`.
 - `pool`: where it ran. Never compare timings across pools.
