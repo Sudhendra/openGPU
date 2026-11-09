@@ -1,8 +1,7 @@
-"""`ogpu top`: a small, colorful live view of the pod — GPU telemetry, who holds the H200, who is queued, spend."""
+"""`ogpu top`: a small, colorful live view of each machine — GPU telemetry, who holds the GPU, who is queued, spend."""
 from __future__ import annotations
 
 import json
-import os
 import select
 import sys
 import termios
@@ -17,6 +16,7 @@ from rich.text import Text
 
 from . import agents, ledger, ssh
 from .config import Config, load_state
+from .providers import SERVERLESS
 from .runner import JOBRUN, fmt_dur
 from .telemetry import SMI, Telemetry, sparkline
 
@@ -43,7 +43,7 @@ def short(cmd: str, n: int = 52) -> str:
 
 
 class Poller:
-    """Background refresh of the job snapshot (SSH) and pod info (RunPod API)."""
+    """Background refresh of the job snapshot (SSH) and machine info (provider API)."""
 
     def __init__(self, cfg: Config, pool: str = "timing"):
         self.cfg = cfg
@@ -66,14 +66,15 @@ class Poller:
             time.sleep(2)
 
     def _pod_loop(self):
-        if not os.environ.get("RUNPOD_API_KEY"):
-            return
         from .pod import client, sync_state
-        rp = client()
+        try:
+            rp = client(self.cfg.pool(self.pool) or self.cfg, load_state(self.pool))
+        except SystemExit:  # no API key: telemetry and jobs still work
+            return
         while not self._stop:
             try:
                 st = load_state(self.pool)
-                self.pod = rp.pod(st.pod_id) if st.pod_id else None
+                self.pod = rp.get(st.pod_id) if st.pod_id else None
                 if self.pod:
                     sync_state(self.pod, pool=self.pool)
             except Exception:  # noqa: BLE001
@@ -108,7 +109,8 @@ def pool_block(cfg: Config, mon: Monitor, idx: int, width: int) -> list:
     up = fmt_dur(pod.uptime_s) if pod and pod.uptime_s else "—"
     h = Text() + Text(f" {idx} ", style="bold black on grey70") + Text(f" {pool.upper()} ", style="bold magenta")
     h += Text(f" {status} ", style=STATUS_STYLE.get(status, "bold black on grey50"))
-    h += Text(f"  {st.gpu or '?'}", style="bold") + Text(f"  runpod/{st.cloud or '?'}  ", style="grey70")
+    h += Text(f"  {st.gpu or '?'}", style="bold")
+    h += Text(f"  {st.provider or cfg.provider}{'/' + st.cloud if st.cloud else ''}  ", style="grey70")
     h += Text(f"${st.cost_per_hr:.2f}/hr", style="bold cyan") + Text(f"  up {up}", style="grey70")
     rows.append(h)
 
@@ -233,7 +235,7 @@ def run_top(cfg: Config, pool: str | None = None) -> None:
     """All pools with a pod (or just `pool`), refreshed live; pools that come up later are picked up."""
     from .config import POOLS
     console = Console()
-    wanted = [pool] if pool else [p for p in POOLS if cfg.pool(p)]
+    wanted = [pool] if pool else [p for p in POOLS if cfg.pool(p) and cfg.pool(p).provider not in SERVERLESS]
     monitors: dict[str, Monitor] = {}
 
     def refresh_monitors():
@@ -269,7 +271,8 @@ def run_top(cfg: Config, pool: str | None = None) -> None:
                 if key == "s":
                     if confirm is not None:  # second s confirms
                         from .pod import client
-                        client().stop(load_state(confirm).pod_id)
+                        st = load_state(confirm)
+                        client(cfg.pool(confirm) or cfg, st).stop(st.pod_id)
                         stopping, confirm = False, None
                     else:
                         stopping = True

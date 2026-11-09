@@ -1,11 +1,11 @@
-"""ogpu — a personal H200 broker + shared bench service for agentic kernel hill-climbing."""
+"""ogpu — the GPU savings engine for coding agents: cheapest capable machine, shared safely, never idle."""
 from __future__ import annotations
 
 import concurrent.futures as cf
 import json
 import os
 import shlex
-import subprocess
+import signal
 import sys
 import time
 import uuid
@@ -18,40 +18,38 @@ from rich.table import Table
 from rich.text import Text
 
 from . import agents, ledger, runner, ssh
-from .config import CONFIG_PATH, LOG_DIR, load_config, load_state
+from .config import CONFIG_PATH, LOG_DIR, REMOTE_OGPU, load_config, load_state
+from .providers import SERVERLESS
+from .providers import modal as modal_backend
 
 app = typer.Typer(add_completion=False, no_args_is_help=True, rich_markup_mode="rich",
-                  help="[bold magenta]ogpu[/] — get an H200, share it safely between agents, never pay for idle.")
+                  help="[bold magenta]ogpu[/] — cheap GPUs for coding agents: shared safely, never paid for idle.")
 console = Console(stderr=True)
 
-# Default $/hr for Modal when the ledger needs a cost estimate (Modal bills per second; override via env).
-MODAL_RATE = {"H200": float(os.environ.get("OGPU_MODAL_H200_HR", 4.54)),
-              "H100": float(os.environ.get("OGPU_MODAL_H100_HR", 3.95)), "none": 0.35}
+POOL_OPT = typer.Option("timing", "--pool", "-p", help="timing (target GPU) or correctness (cheaper GPU pool)")
 
 
-POOL_OPT = typer.Option("timing", "--pool", "-p", help="timing (target GPU) or correctness (cheap same-ISA GPU)")
-
-
-def _pool_cfg(pool: str):
+def _pool_cfg(pool: str, machine: bool = True):
     from .config import POOLS
     if pool not in POOLS:
         raise typer.BadParameter(f"unknown pool {pool!r} (choose from {', '.join(POOLS)})")
     pcfg = load_config().pool(pool)
     if pcfg is None:
-        raise SystemExit(f"pool {pool!r} is disabled in {CONFIG_PATH}")
+        raise SystemExit(f"pool {pool!r} is not configured in {CONFIG_PATH}")
+    if machine and pcfg.provider in SERVERLESS:
+        raise SystemExit(f"the {pool} pool runs on {pcfg.provider} (serverless): there is no machine to manage")
     return pcfg
 
 
 @app.command()
 def up(retry: float = typer.Option(0, help="keep retrying for capacity this many minutes"), pool: str = POOL_OPT):
-    """Reuse, resume, or create the pool's pod and wait until SSH works."""
+    """Reuse, resume, or create the pool's machine and wait until SSH works."""
     import fcntl
 
     from . import pod
     from .config import HOME
     pcfg = _pool_cfg(pool)
-    lock_name = "up.lock" if pool == "timing" else f"up-{pool}.lock"
-    with open(HOME / lock_name, "w") as lk:  # same lock as auto-up and background warm-up
+    with open(HOME / pod.up_lock(pool), "w") as lk:  # same lock as auto-up and background warm-up
         fcntl.flock(lk, fcntl.LOCK_EX)
         pod.up(pcfg, console, retry_minutes=retry, pool=pool)
 
@@ -59,11 +57,12 @@ def up(retry: float = typer.Option(0, help="keep retrying for capacity this many
 @app.command()
 def down(terminate: bool = typer.Option(False, "--terminate", help="delete the pod and its disk (not just stop)"),
          pool: str = POOL_OPT):
-    """Stop the pool's pod now (disk + caches kept). --terminate deletes it."""
+    """Stop the pool's machine now (disk + caches kept). --terminate deletes it."""
     from . import pod
     from .config import State, save_state
-    rp = pod.client()
-    p = pod.current(rp, _pool_cfg(pool), pool)
+    pcfg = _pool_cfg(pool)
+    rp = pod.client(pcfg)
+    p = pod.current(rp, pcfg, pool)
     if not p:
         console.print(f"[grey50]no {pool} pod[/]")
         return
@@ -81,46 +80,51 @@ def down(terminate: bool = typer.Option(False, "--terminate", help="delete the p
 
 @app.command()
 def status(as_json: bool = typer.Option(False, "--json")):
-    """Every pool's pod: state, price, uptime; plus today's spend."""
+    """Every pool's machine: provider, state, price, uptime; plus today's spend."""
     from . import pod
     from .config import POOLS
     cfg = load_config()
-    rp = pod.client()
-    pods = {}
+    pods, serverless = {}, {}
+    for name in POOLS:
+        pcfg = cfg.pool(name)
+        if pcfg is None:
+            continue
+        if pcfg.provider in SERVERLESS:
+            serverless[name] = pcfg.provider
+            continue
+        p = pod.current(pod.client(pcfg), pcfg, name)
+        if p:
+            pod.sync_state(p, pool=name, provider=pcfg.provider)
+        pods[name] = p
     with ledger.connect() as db:
-        for name in POOLS:
-            pcfg = cfg.pool(name)
-            p = pod.current(rp, pcfg, name) if pcfg else None
-            if p:
-                if p.uptime_s:
-                    ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
-                pod.sync_state(p, pool=name)
-            pods[name] = p
         today = ledger.spend(db, ledger.today_start())
     if as_json:
-        print(json.dumps({"pods": {n: (p.__dict__ if p else None) for n, p in pods.items()},
-                          "pod": pods["timing"].__dict__ if pods.get("timing") else None,
+        print(json.dumps({"pods": {n: (p.__dict__ if p else None) for n, p in pods.items()}, "serverless": serverless,
                           "today_usd": round(today, 2), "budget_usd": cfg.budget_usd}))
         return
+    for name, prov in serverless.items():
+        console.print(f"[cyan]◇[/] [magenta]{name:<11}[/] {prov} (serverless: billed per job, nothing idles)")
     for name, p in pods.items():
         if not p:
-            console.print(f"[grey50]○ {name:<11} no pod[/]")
+            console.print(f"[grey50]○ {name:<11} no machine[/]")
             continue
         color = {"RUNNING": "green", "EXITED": "yellow"}.get(p.status, "red")
         console.print(f"[{color}]●[/] [magenta]{name:<11}[/] [bold]{p.id}[/] {p.status} · {p.gpu} · "
-                      f"${p.cost_per_hr:.2f}/hr · up {runner.fmt_dur(p.uptime_s or 0)} · ssh root@{p.ssh_host}:{p.ssh_port}")
+                      f"${p.cost_per_hr:.2f}/hr · up {runner.fmt_dur(p.uptime_s or 0)} · "
+                      f"ssh {p.ssh_user}@{p.ssh_host}:{p.ssh_port}")
     console.print(f"  today ${today:.2f} / ${cfg.budget_usd:.0f} cap")
 
 
-CMD_ARG = typer.Argument(..., help="command to run on the pod (put it after --)")
-GPU_OPT = typer.Option(True, "--gpu/--cpu", help="--gpu takes the exclusive H200 lock; --cpu runs now, in parallel")
+CMD_ARG = typer.Argument(..., help="command to run on the GPU machine (put it after --)")
+GPU_OPT = typer.Option(True, "--gpu/--cpu", help="--gpu takes the exclusive GPU lock; --cpu runs now, in parallel")
 TRACK_OPT = typer.Option(Path("."), "--track", "-t", help="dir to sync and run in (default: cwd)")
 WITH_OPT = typer.Option([], "--with", "-w", help="extra dirs to sync next to the track")
-FORCE_OPT = typer.Option(False, "--force", "-f", help="ignore the content-hash cache")
+CACHE_OPT = typer.Option(None, "--cache/--no-cache", help="reuse an identical earlier run instead of paying again "
+                         "(default: `cache` in the config, off unless set)")
 NOTE_OPT = typer.Option("", "--note", "-m", help="hypothesis / what changed (stored in the shared ledger)")
 TIMEOUT_OPT = typer.Option(None, "--timeout", help="kill the job after this many seconds (exit 124)")
-FIDELITY_OPT = typer.Option("timing", "--fidelity", help="timing: run on the target GPU (H200). correctness: may run on "
-                            "the cheaper same-ISA pool (H100) — use for --check / numerics, never for timings you trust")
+FIDELITY_OPT = typer.Option("timing", "--fidelity", help="timing: run on the target GPU. correctness: may run on the "
+                            "cheaper correctness pool — use for checks / numerics, never for timings you trust")
 
 
 def _fidelity(f: str) -> str:
@@ -141,29 +145,29 @@ def _command(cmd: list[str]) -> str:
 
 @app.command(context_settings={"allow_interspersed_args": False})
 def run(cmd: list[str] = CMD_ARG, gpu: bool = GPU_OPT, track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT,
-        force: bool = FORCE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
+        cache: Optional[bool] = CACHE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
         fidelity: str = FIDELITY_OPT, as_json: bool = typer.Option(False, "--json", help="machine output for agents (one JSON line)"),
         quiet: bool = typer.Option(False, "--quiet", "-q", help="don't stream the log")):
-    """Sync the track, run CMD on the pod (GPU-locked or CPU-parallel), stream the log, record the result.
+    """Sync the track, run CMD on the GPU machine (GPU-locked or CPU-parallel), stream the log, record the result.
 
     Exit code: the job's own, 2 = daily budget cap hit, 3 = benchmark passed but correctness checks FAILED."""
     rc = runner.run(load_config(), track=track, extra=with_, cmd=_command(cmd), mode="gpu" if gpu else "cpu",
-                    force=force, as_json=as_json, quiet=quiet, note=note, timeout_s=timeout,
+                    cache=cache, as_json=as_json, quiet=quiet, note=note, timeout_s=timeout,
                     fidelity=_fidelity(fidelity))
     raise typer.Exit(rc)
 
 
 @app.command(context_settings={"allow_interspersed_args": False})
 def submit(cmd: list[str] = CMD_ARG, gpu: bool = GPU_OPT, track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT,
-           force: bool = FORCE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
+           cache: Optional[bool] = CACHE_OPT, note: str = NOTE_OPT, timeout: Optional[float] = TIMEOUT_OPT,
            fidelity: str = FIDELITY_OPT):
     """Queue CMD and return immediately with its id (JSON). Collect with `ogpu wait <id>...`.
 
-    A cache hit returns the finished result right away (status done/failed)."""
+    With --cache, a hit returns the finished result right away (status done/failed)."""
     con = Console(stderr=True)
     try:
         r = runner.submit(load_config(), con, track=track, extra=with_, cmd=_command(cmd),
-                          mode="gpu" if gpu else "cpu", force=force, note=note, timeout_s=timeout,
+                          mode="gpu" if gpu else "cpu", cache=cache, note=note, timeout_s=timeout,
                           fidelity=_fidelity(fidelity))
     except runner.BudgetExceeded as e:
         print(json.dumps({"status": "budget_exceeded", "error": e.msg}))
@@ -195,8 +199,8 @@ def wait(ids: list[str] = typer.Argument(..., help="job ids from `ogpu submit`")
 @app.command(context_settings={"allow_interspersed_args": True})
 def sweep(cands: list[str] = typer.Argument(..., help="candidate files / variants (file.py@NAME=VAL) to compare"),
           best: Optional[str] = typer.Option(None, "--best", "-b", help="current best (timed alongside, never dropped)"),
-          bench: str = typer.Option("python3 pod/bench.py", "--bench",
-                                    help="bench command; candidates are appended (or replace {files})"),
+          bench: Optional[str] = typer.Option(None, "--bench", help="bench command; candidates are appended (or "
+                                              "replace {files}). Required unless profile = okc"),
           compile_tpl: Optional[str] = typer.Option(None, "--compile", help="per-candidate CPU gate; {file} = path"),
           check_flag: str = typer.Option("--check", "--check-flag", help="flag that makes the bench run checks"),
           correct_args: str = typer.Option("--reps 3", "--correct-args", help="extra args for the correctness stage"),
@@ -205,18 +209,22 @@ def sweep(cands: list[str] = typer.Argument(..., help="candidate files / variant
           top_k: int = typer.Option(2, "--top-k", "-k", help="finalists kept after quick timing"),
           noise: float = typer.Option(0.015, "--noise", help="relative win needed to beat best / stay in contention"),
           track: Path = TRACK_OPT, with_: list[Path] = WITH_OPT, note: str = NOTE_OPT,
-          timeout: Optional[float] = TIMEOUT_OPT, force: bool = FORCE_OPT,
+          timeout: Optional[float] = TIMEOUT_OPT, cache: Optional[bool] = CACHE_OPT,
           as_json: bool = typer.Option(False, "--json", help="one JSON report on stdout")):
     """Tournament: compile (CPU) → correctness (cheap pool) → quick timing → full timing for finalists → ranked verdict.
 
     Most candidates never reach the expensive GPU, and each stage is one batched job (prepare paid once)."""
     from . import sweep as sw
     con = Console(stderr=True, quiet=as_json)
+    cfg = load_config()
+    bench = bench or ("python3 pod/bench.py" if cfg.profile == "okc" else None)
+    if not bench:
+        raise typer.BadParameter("--bench is required (e.g. --bench 'python3 bench.py {files} --fast')")
     try:
-        run = sw.Sweep(load_config(), con, track=track.resolve(), extra=with_, cands=cands, best=best, bench=bench,
+        run = sw.Sweep(cfg, con, track=track.resolve(), extra=with_, cands=cands, best=best, bench=bench,
                        compile_tpl=compile_tpl, check_flag=check_flag, correct_args=correct_args,
                        quick_args=quick_args, full_args=full_args, top_k=top_k, noise=noise, note=note,
-                       timeout_s=timeout, force=force)
+                       timeout_s=timeout, cache=cache)
         rep = run.run()
     except runner.BudgetExceeded as e:
         print(json.dumps({"status": "budget_exceeded", "error": e.msg}))
@@ -229,7 +237,7 @@ def sweep(cands: list[str] = typer.Argument(..., help="candidate files / variant
 
 @app.command()
 def top(pool: Optional[str] = typer.Option(None, "--pool", "-p", help="show only this pool (default: all)")):
-    """Live dashboard for every pod: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdowns."""
+    """Live dashboard for every machine: GPU telemetry, lock holder, queue, agents, spend, idle-stop countdowns."""
     from .tui import run_top
     if pool:
         _pool_cfg(pool)
@@ -238,7 +246,7 @@ def top(pool: Optional[str] = typer.Option(None, "--pool", "-p", help="show only
 
 @app.command()
 def logs(job_id: str, follow: bool = typer.Option(False, "--follow", "-f")):
-    """Print a job's log (local copy if present, else from the pod). -f follows a running job."""
+    """Print a job's log (local copy if present, else from the machine). -f follows a running job."""
     cfg = load_config()
     local = LOG_DIR / f"{job_id}.log"
     if follow:
@@ -253,15 +261,23 @@ def logs(job_id: str, follow: bool = typer.Option(False, "--follow", "-f")):
         sys.stdout.write(local.read_text(errors="replace"))
         return
     p = ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path,
-                f"cat /workspace/.ogpu/jobs/{shlex.quote(job_id)}.log", check=False)
+                f"cat {REMOTE_OGPU}/jobs/{shlex.quote(job_id)}.log", check=False)
     sys.stdout.write(p.stdout or p.stderr)
 
 
 @app.command()
 def cancel(job_id: str):
-    """Kill a queued or running job on the pod."""
+    """Kill a queued or running job."""
     cfg = load_config()
-    ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
+    with ledger.connect() as db:
+        row = ledger.get(db, job_id)
+    if row and row["handle"]:  # serverless: interrupting `modal run` stops its containers
+        try:
+            os.killpg(json.loads(row["handle"])["pid"], signal.SIGINT)
+        except OSError:
+            pass
+    else:
+        ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
     console.print(f"[yellow]■[/] cancelled {job_id}")
 
 
@@ -366,61 +382,63 @@ def cost(as_json: bool = typer.Option(False, "--json")):
 
 
 @app.command()
-def gpus(filter_: str = typer.Argument("H", metavar="FILTER")):
-    """List RunPod GPU type ids + prices (to fill gpu_type_ids in the config)."""
-    from . import pod
+def gpus(filter_: str = typer.Argument("", metavar="FILTER"),
+         provider: Optional[str] = typer.Option(None, "--provider", help="default: the config's provider")):
+    """List a provider's GPU ids + prices (to fill gpu_type_ids in the config)."""
+    from . import providers
+    cfg = load_config()
+    name = provider or cfg.provider
+    rows = modal_backend.gpu_types() if name == "modal" else providers.load(name, cfg).gpu_types()
     t = Table(box=None, header_style="bold magenta")
-    for c in ("id", "memory", "secure $/hr", "community $/hr"):
+    for c in ("id", "memory", "$/hr"):
         t.add_column(c)
-    for g in pod.client().gpu_types():
-        if filter_.lower() in (g["id"] + g["displayName"]).lower():
-            t.add_row(g["id"], f"{g['memoryInGb']} GB", str(g.get("securePrice") or "—"), str(g.get("communityPrice") or "—"))
+    for g in rows:
+        if filter_.lower() in str(g["id"]).lower():
+            t.add_row(str(g["id"]), f"{g['memory_gb']} GB" if g["memory_gb"] else "", str(g["price"] or "—"))
     Console().print(t)
 
 
 @app.command()
 def fanout(cmds_file: Path,
-           backend: str = typer.Option("modal", "--backend", "-b", help="modal (parallel containers) or runpod (queued on the pod)"),
-           gpu: str = typer.Option("H200", "--gpu", help="modal GPU: H200, H100 (same sm_90a; correctness/compile), none"),
+           provider: Optional[str] = typer.Option(None, "--provider", help="modal: one container per command; a machine "
+                                                  "provider: queued on the pool's machine (default: the config's)"),
+           gpu: Optional[str] = typer.Option(None, "--gpu", help="modal GPU (H200, H100, L4, ..., none)"),
            track: Path = typer.Option(Path("."), "--track", "-t")):
     """Run one command per line of CMDS_FILE in parallel and record every result in the ledger."""
     cfg = load_config()
     track = track.resolve()
     cmds = [ln.strip() for ln in cmds_file.read_text().splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
-    agent = agents.detect()
-    if backend == "runpod":
-        argv0 = [sys.executable, "-m", "ogpu", "run", "--quiet", "--json", "--track", str(track), "--"]
-        with cf.ThreadPoolExecutor(len(cmds)) as ex:
-            futs = {ex.submit(subprocess.run, argv0 + [c], capture_output=True, text=True): c for c in cmds}
+    provider = provider or cfg.provider
+    if provider not in SERVERLESS:
+        quiet = Console(stderr=True, quiet=True)
+        subs = [runner.submit(cfg, console, track=track, extra=[], cmd=c, mode="gpu") for c in cmds]
+        with cf.ThreadPoolExecutor(max(1, len(subs))) as ex:
+            futs = [ex.submit(lambda s: s if s["status"] != "queued" else runner.wait(cfg, quiet, s["id"], stream=False),
+                              s) for s in subs]
             for f in cf.as_completed(futs):
-                out = f.result().stdout.strip().splitlines()
-                r = json.loads(out[-1]) if out else {"status": "error"}
-                mark = "[green]✔[/]" if r.get("status") == "done" else "[red]✘[/]"
-                console.print(f"{mark} {futs[f][:60]} · "
-                              f"{ledger.headline(r.get('metrics') or {})}")
+                runner.emit(console, f.result(), False)
         return
+    gpu = gpu or (cfg.gpu_type_ids[0] if cfg.provider == "modal" and cfg.gpu_type_ids else modal_backend.DEFAULT_GPU)
     stamp = time.strftime("%m%d_%H%M%S")
     results_path = track / "output" / "ogpu-modal" / stamp / "results.json"
-    env = os.environ | {"OGPU_TRACK": str(track), "OGPU_MODAL_GPU": gpu, "OGPU_RESULTS": str(results_path),
-                        "OGPU_IMAGE": cfg.image}
-    app_path = Path(__file__).parent / "providers" / "modal_app.py"
     console.print(f"[cyan]fanout[/] {len(cmds)} jobs → modal {gpu} · track {track.name}")
-    rc = subprocess.run(["modal", "run", str(app_path), "--cmds", str(cmds_file.resolve())], env=env).returncode
+    rc = modal_backend.launch(cfg, track=track, extra=[], cmds=cmds, gpu=gpu, results=results_path, log=Path(),
+                              timeout_s=None, detach=False)
     if not results_path.exists():
         raise typer.Exit(rc or 1)
-    rate = MODAL_RATE.get(gpu, MODAL_RATE["H200"])
+    agent = agents.detect()
     with ledger.connect() as db:
         for r in json.loads(results_path.read_text()):
             if "error" in r:
                 console.print(f"[red]✘[/] {r['error']}")
                 continue
             log = Path(r["log_path"]).read_text(errors="replace")
-            m = ledger.parse_metrics(log)
-            key = ledger.content_key([track], r["cmd"], f"modal-{gpu}", cfg.image)
-            row = {"id": f"m{stamp}-{r['i']}-{uuid.uuid4().hex[:4]}", "key": key, "agent": agent, "track": track.name,
-                   "cmd": r["cmd"], "mode": f"modal-{gpu}", "backend": "modal", "status": "done" if r["rc"] == 0 else "failed",
-                   "exit_code": r["rc"], "started": time.time() - r["wall_s"], "ended": time.time(), "wall_s": r["wall_s"],
-                   "cost_usd": r["wall_s"] / 3600 * rate, "metrics": m, "log_path": r["log_path"], "cached_from": None}
+            ended = r.get("ended") or time.time()
+            row = {"id": f"m{stamp}-{r['i']}-{uuid.uuid4().hex[:4]}", "key": None, "agent": agent, "track": track.name,
+                   "cmd": r["cmd"], "mode": "gpu" if gpu != "none" else "cpu", "backend": "modal",
+                   "status": "done" if r["rc"] == 0 else "failed", "exit_code": r["rc"], "started": ended - r["wall_s"],
+                   "ended": ended, "wall_s": r["wall_s"], "cost_usd": r["wall_s"] / 3600 * modal_backend.rate(gpu),
+                   "metrics": ledger.parse_metrics(log, cfg.profile), "log_path": r["log_path"], "cached_from": None}
             ledger.record(db, **row)
             runner.result_line(console, row)
 

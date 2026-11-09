@@ -1,11 +1,13 @@
-"""`ogpu run` / `submit` / `wait`: sync → submit to the on-pod runner → poll (survives SSH drops) → pull out/ →
-classify → ledger. `run` = submit + wait in one call."""
+"""`ogpu run` / `submit` / `wait`: sync → submit to the on-machine runner → poll (survives SSH drops) → pull out/ →
+classify → ledger. Serverless pools (Modal) launch one container per job instead. `run` = submit + wait."""
 from __future__ import annotations
 
 import base64
 import fcntl
 import json
+import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -16,7 +18,9 @@ from rich.console import Console
 from rich.text import Text
 
 from . import agents, failures, ledger, notify, pod, ssh
-from .config import HOME, LOG_DIR, REMOTE_OGPU, REMOTE_ROOT, Config, State, load_state
+from .config import HOME, LOG_DIR, REMOTE_OGPU, Config, State, load_state
+from .providers import SERVERLESS
+from .providers import modal as modal_backend
 
 JOBRUN = f"python3 {REMOTE_OGPU}/bin/jobrun.py"
 RESULT_KEYS = ("id", "status", "failure", "error", "exit_code", "wall_s", "cost_usd", "metrics", "note", "pool",
@@ -24,8 +28,8 @@ RESULT_KEYS = ("id", "status", "failure", "error", "exit_code", "wall_s", "cost_
 NEAR_BOUND = 0.8  # correctness-pool passes above this fraction of the bound get re-confirmed on the timing pool
 
 
-def remote_dir(local: Path) -> str:
-    return f"{REMOTE_ROOT}/{local.resolve().name}"
+def remote_dir(cfg: Config, local: Path) -> str:
+    return f"{cfg.remote_root}/{local.resolve().name}"
 
 
 def submit_argv(spec: dict) -> str:
@@ -70,18 +74,21 @@ def emit(console: Console, r: dict, as_json: bool) -> int:
 # ---------------------------------------------------------------- submit
 
 
-def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd: str, mode: str, force: bool,
-           note: str = "", timeout_s: float | None = None, fidelity: str = "timing") -> dict:
-    """Returns either a finished result (cache hit) or {"id", "status": "queued"} for `wait`."""
+def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd: str, mode: str,
+           cache: bool | None = None, note: str = "", timeout_s: float | None = None, fidelity: str = "timing") -> dict:
+    """Returns either a finished result (cache hit) or {"id", "status": "queued"} for `wait`. `cache` (default: the
+    config's) reuses an identical earlier run and joins an identical in-flight one instead of paying twice."""
     agent = agents.detect()
     track = track.resolve()
     roots = [track, *[e.resolve() for e in extra]]
-    # fidelity is part of the key: a correctness run on an H100 must not satisfy a timing request on the H200
-    key = ledger.content_key(roots, cmd, mode if fidelity == "timing" else f"{mode}:{fidelity}", cfg.image)
+    cache = cfg.cache if cache is None else cache
+    # fidelity is part of the key: a correctness run on a cheap GPU must not satisfy a timing request
+    key = ledger.content_key(roots, cmd, mode if fidelity == "timing" else f"{mode}:{fidelity}", cfg.image) \
+        if cache else None
     db = ledger.connect()
     now = time.time()
 
-    if not force and (hit := ledger.cached(db, key)):
+    if cache and (hit := ledger.cached(db, key)):
         r = as_result(hit) | {"id": uuid.uuid4().hex[:10], "agent": agent, "cached_from": hit["id"], "cost_usd": 0.0,
                               "wall_s": 0.0, "backend": "cache", "started": now, "ended": now, "submitted": now,
                               "note": note or hit["note"]}
@@ -90,7 +97,7 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
                                                    "log_path", "cached_from", "track_path", "note", "failure",
                                                    "error", "submitted")})
         return r
-    if not force and (fly := ledger.in_flight(db, key)):
+    if cache and (fly := ledger.in_flight(db, key)):
         console.print(f"[yellow]≡[/] identical job {fly['id']} already in flight ({fly['agent']}) — waiting on it")
         return {"id": fly["id"], "status": "queued", "deduped": True}
 
@@ -104,9 +111,13 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
     pool = choose_pool(cfg, console, mode, fidelity)
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     timeout_s = timeout_s or cfg.default_timeout_s or None
+    handle = None
     while True:
         try:
-            push_and_start(cfg, console, pool, jid, agent, track, roots, cmd, mode, key, timeout_s, db)
+            if cfg.pool(pool).provider in SERVERLESS:
+                handle = start_serverless(cfg.pool(pool), jid, track, roots[1:], cmd, mode, timeout_s)
+            else:
+                push_and_start(cfg, console, pool, jid, agent, track, roots, cmd, mode, key, timeout_s, db)
             break
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             err = (getattr(e, "stderr", None) or "").strip().splitlines()[-3:]
@@ -117,8 +128,8 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
                 pool = "timing"
                 continue
             raise SystemExit(f"could not start the job on the {pool} pod: {detail}") from None
-    ledger.record(db, id=jid, key=key, agent=agent, track=track.name, cmd=cmd, mode=mode, backend="runpod",
-                  status="queued", exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
+    ledger.record(db, id=jid, key=key, agent=agent, track=track.name, cmd=cmd, mode=mode,
+                  backend=cfg.pool(pool).provider, status="queued", handle=json.dumps(handle) if handle else None, exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
                   log_path=str(LOG_DIR / f"{jid}.log"), cached_from=None, track_path=str(track), note=note,
                   extra_paths=json.dumps([str(e.resolve()) for e in extra]),
                   failure=None, error=None, timeout_s=timeout_s, submitted=now, pool=pool)
@@ -130,15 +141,24 @@ def push_and_start(cfg: Config, console: Console, pool: str, jid: str, agent: st
     pcfg = cfg.pool(pool)
     st = pod.ensure(pcfg, console, pool)
     k = cfg.private_key_path
-    spec = {"id": jid, "agent": agent, "track": track.name, "cmd": cmd, "mode": mode, "cwd": remote_dir(track),
-            "roots": [remote_dir(r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing,
+    spec = {"id": jid, "agent": agent, "track": track.name, "cmd": cmd, "mode": mode, "cwd": remote_dir(pcfg, track),
+            "roots": [remote_dir(pcfg, r) for r in roots], "key": key, "timeout_s": timeout_s, "quiet": cfg.quiet_timing,
             **hang_policy(cfg, db, track.name, cmd, pool)}
     # push + submit (which snapshots the synced dirs on the pod) must not interleave with another agent's push
     with open(HOME / f"push-{pool}-{track.name}.lock", "w") as lk, console.status(f"[cyan]syncing {track.name}…"):
         fcntl.flock(lk, fcntl.LOCK_EX)
         for r in roots:
-            ssh.push(st, k, r, remote_dir(r))
+            ssh.push(st, k, r, remote_dir(pcfg, r))
         ssh.run(st, k, submit_argv(spec), timeout=120)
+
+
+def start_serverless(pcfg: Config, jid: str, track: Path, extra: list[Path], cmd: str, mode: str, timeout_s) -> dict:
+    gpu = modal_backend.gpu_for(pcfg, mode)
+    results = LOG_DIR / f"{jid}.modal" / "results.json"
+    launcher_log = LOG_DIR / f"{jid}.modal.log"
+    p = modal_backend.launch(pcfg, track=track, extra=extra, cmds=[cmd], gpu=gpu, results=results, log=launcher_log,
+                             timeout_s=timeout_s, detach=True)
+    return {"pid": p.pid, "results": str(results), "log": str(launcher_log), "gpu": gpu}
 
 
 def hang_policy(cfg: Config, db, track: str, cmd: str, pool: str) -> dict:
@@ -155,6 +175,8 @@ def choose_pool(cfg: Config, console: Console, mode: str, fidelity: str) -> str:
     in the background and run this job on the timing pod: a correctness check never waits on a cold boot."""
     if mode != "gpu" or fidelity != "correctness" or (pcfg := cfg.pool("correctness")) is None:
         return "timing"
+    if pcfg.provider in SERVERLESS:  # nothing to warm up
+        return "correctness"
     if ssh.reachable(load_state("correctness"), pcfg.private_key_path):
         return "correctness"
     warm_pool_in_background("correctness")
@@ -199,18 +221,23 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
         if row["status"] in ledger.TERMINAL:
             return as_result(row)
         pool = row["pool"] or "timing"
-        st = load_state(pool)
-        k = cfg.private_key_path
         log_path = Path(row["log_path"])
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_bytes(b"")  # poll_loop re-reads from offset 0
-        status, rc, started, ended, last = poll_loop(console, st, k, jid, log_path, stream=stream, pool=pool)
-        track = Path(row["track_path"] or ".")
-        out_local = track / "output" / "ogpu" / jid
-        if ssh.pull(st, k, f"{REMOTE_ROOT}/.runs/{jid}/{row['track']}/out", out_local) and not any(out_local.iterdir()):
-            out_local.rmdir()
+        out_local = Path(row["track_path"] or ".") / "output" / "ogpu" / jid
+        if row["handle"]:  # serverless
+            h = json.loads(row["handle"])
+            status, rc, started, ended, last = wait_serverless(console, h, log_path, out_local, stream=stream)
+            rate = modal_backend.rate(h["gpu"])
+        else:
+            st = load_state(pool)
+            k = cfg.private_key_path
+            status, rc, started, ended, last = poll_loop(console, st, k, jid, log_path, stream=stream, pool=pool)
+            if ssh.pull(st, k, f"{REMOTE_OGPU}/runs/{jid}/{row['track']}/out", out_local) and not any(out_local.iterdir()):
+                out_local.rmdir()
+            rate = st.cost_per_hr
         log = log_path.read_text(errors="replace")
-        metrics = ledger.parse_metrics(log)
+        metrics = ledger.parse_metrics(log, cfg.profile)
         failure, error = failures.classify(status, rc, log, metrics, hang=last.get("hang"))
         if status == "lost" and (last.get("runner_signal") or last.get("orphan_killed")):
             error = (error or "") + (f"\nrunner got {last['runner_signal']}" if last.get("runner_signal") else "") + \
@@ -218,8 +245,9 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
         wall = (ended or time.time()) - (started or time.time()) if started else 0.0
         prev_best = ledger.track_best(db, row["track"], exclude_id=jid)
         ledger.update(db, jid, status=status, exit_code=rc, started=started, ended=ended or time.time(), wall_s=wall,
-                      cost_usd=wall / 3600 * st.cost_per_hr, metrics=metrics, failure=failure, error=error)
-        record_uptime(st, db)
+                      cost_usd=wall / 3600 * rate, metrics=metrics, failure=failure, error=error)
+        if not row["handle"]:
+            record_uptime(cfg.pool(pool) or cfg, st, db)
         r = as_result(ledger.get(db, jid))
         if pool != "timing" and not failure and metrics.get("check_margin", 0) > NEAR_BOUND:
             # measured: an H100 shifts error values by up to ~17% of the bound vs the H200
@@ -231,18 +259,68 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
             notify.send("ogpu · hung job killed", f"{row['track']} ({row['agent']}): {(last.get('hang') or {}).get('reason', '')}")
         if not failure and b is not None and (prev_best is None or b > prev_best):
             r["new_best"] = True
-            notify.send("ogpu · new best", f"{row['track']}: {b:.4f}× ({row['agent']})"
-                        + (f" — was {prev_best:.4f}×" if prev_best else ""))
+            notify.send("ogpu · new best", f"{row['track']}: {b:.4g} ({row['agent']})"
+                        + (f" — was {prev_best:.4g}" if prev_best else ""))
         return r
 
 
-def record_uptime(st: State, db) -> None:
+def wait_serverless(console: Console, h: dict, log_path: Path, out_local: Path, *, stream: bool):
+    """Follow a detached `modal run` until its results file appears (or the launcher dies without one)."""
+    launcher_log, results = Path(h["log"]), Path(h["results"])
+    offset = 0
+    spinner = console.status("[cyan]starting container…")
+    spinner.start()
+    try:
+        while True:
+            done = results.exists() or not pid_alive(h["pid"])
+            if stream and launcher_log.exists():
+                with open(launcher_log, "rb") as f:
+                    f.seek(offset)
+                    chunk = f.read()
+                if chunk:
+                    spinner.stop()
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.flush()
+                    offset += len(chunk)
+            if done:
+                break
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]detached[/] — the job keeps running. `ogpu wait <id>` / `ogpu cancel <id>`")
+        raise SystemExit(130)
+    finally:
+        spinner.stop()
+    tail = launcher_log.read_text(errors="replace")[-4000:] if launcher_log.exists() else ""
+    if not results.exists():
+        log_path.write_text(tail)
+        return "lost", -1, None, time.time(), {}
+    r = (json.loads(results.read_text()) or [{"error": "no result"}])[0]
+    if "error" in r:
+        log_path.write_text(tail + "\n" + r["error"] + "\n")
+        return "failed", 1, None, time.time(), {}
+    log_path.write_text(Path(r["log_path"]).read_text(errors="replace"))
+    src = results.parent / str(r["i"])
+    if src.is_dir() and any(src.iterdir()):
+        shutil.copytree(src, out_local, dirs_exist_ok=True)
+    ended = r.get("ended") or results.stat().st_mtime
+    return ("done" if r["rc"] == 0 else "failed"), r["rc"], ended - r["wall_s"], ended, {}
+
+
+def pid_alive(pid) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def record_uptime(pcfg: Config, st: State, db) -> None:
     """Paid time comes from the provider's uptime; sample it after every job so spend (and the budget cap) never
     depends on someone running `status` or `top`. Best effort: never fails a job."""
     if not st.pod_id:
         return
     try:
-        p = pod.client().pod(st.pod_id)
+        p = pod.client(pcfg, st).get(st.pod_id)
         if p and p.uptime_s:
             ledger.record_session(db, p.id, p.uptime_s, p.cost_per_hr)
     except Exception:  # noqa: BLE001
@@ -256,17 +334,17 @@ def wait(cfg: Config, console: Console, jid: str, *, stream: bool, retry_lost: i
         console.print(f"[yellow]↻[/] job {jid} was lost (pod restarted) — resubmitting once")
         extra = [Path(p) for p in json.loads(r.get("extra_paths") or "[]")]
         fidelity = "correctness" if r.get("pool") == "correctness" else "timing"
-        sub = submit(cfg, console, track=Path(r["track_path"]), extra=extra, cmd=r["cmd"], mode=r["mode"], force=True,
+        sub = submit(cfg, console, track=Path(r["track_path"]), extra=extra, cmd=r["cmd"], mode=r["mode"], cache=False,
                      note=r.get("note") or "", timeout_s=r.get("timeout_s"), fidelity=fidelity)
         r = finalize(cfg, console, sub["id"], stream=stream) if sub["status"] == "queued" else sub
     return r
 
 
-def run(cfg: Config, *, track: Path, extra: list[Path], cmd: str, mode: str, force: bool, as_json: bool, quiet: bool,
-        note: str = "", timeout_s: float | None = None, fidelity: str = "timing") -> int:
+def run(cfg: Config, *, track: Path, extra: list[Path], cmd: str, mode: str, cache: bool | None, as_json: bool,
+        quiet: bool, note: str = "", timeout_s: float | None = None, fidelity: str = "timing") -> int:
     console = Console(stderr=True, quiet=as_json)
     try:
-        sub = submit(cfg, console, track=track, extra=extra, cmd=cmd, mode=mode, force=force, note=note,
+        sub = submit(cfg, console, track=track, extra=extra, cmd=cmd, mode=mode, cache=cache, note=note,
                      timeout_s=timeout_s, fidelity=fidelity)
     except BudgetExceeded as e:
         if as_json:
@@ -297,9 +375,9 @@ def poll_loop(console: Console, st: State, key: str, jid: str, log_path: Path, *
                     failures_ = 0
                 except (subprocess.SubprocessError, ValueError) as e:
                     failures_ += 1
-                    spinner.update(f"[yellow]connection lost ({failures_}) · job keeps running on the pod · retrying")
+                    spinner.update(f"[yellow]connection lost ({failures_}) · job keeps running on the machine · retrying")
                     if failures_ > 40:
-                        raise SystemExit(f"lost contact with pod for too long; job {jid} may still be running "
+                        raise SystemExit(f"lost contact with the machine for too long; job {jid} may still be running "
                                          f"(`ogpu wait {jid}`)") from e
                     time.sleep(min(15, 2 * failures_))
                     continue
@@ -316,7 +394,7 @@ def poll_loop(console: Console, st: State, key: str, jid: str, log_path: Path, *
                 if status == "queued":
                     h = d.get("holder") or {}
                     who = f" · holder {h.get('agent')}({h.get('track')}) {fmt_dur(time.time() - h['since'])}" if h else ""
-                    spinner.update(f"[cyan]waiting for H200 lock · position {d.get('queue_pos')}{who}")
+                    spinner.update(f"[cyan]waiting for the GPU lock · position {d.get('queue_pos')}{who}")
                     spinner.start()
                 if status in ledger.TERMINAL:
                     return status, d.get("exit_code"), d.get("started"), d.get("ended"), d

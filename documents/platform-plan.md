@@ -1,6 +1,6 @@
 # From challenge helper to compute broker: platform plan
 
-*2026-10-30. Builds on [`feasibility-analysis.md`](feasibility-analysis.md) and [`roadmap.md`](roadmap.md).*
+*2026-10-30. Builds on [`feasibility-analysis.md`](feasibility-analysis.md).*
 
 ## 1. Where we are
 `ogpu` started as a way to win one kernel competition. Along the way it became the **Layer 1 "efficiency layer"** from the feasibility analysis:

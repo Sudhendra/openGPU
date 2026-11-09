@@ -7,14 +7,12 @@
 
 Most candidates never reach the expensive GPU, and prepare is paid once per stage instead of once per candidate.
 
-Bench contract (what decode/attention pod/bench.py already do): the bench takes candidate paths as arguments and
-prints, per candidate, `CHECK <case> <name> <tag>: PASS|FAIL ...` and `SCORE <name>: <speedup>` (higher = better),
+Bench contract: the bench takes candidate paths as arguments and prints, per candidate, `CHECK <case> <name> <tag>: PASS|FAIL ...` and `SCORE <name>: <speedup>` (higher = better),
 where <name> is the argument's basename (`cand/a.py@X=1` → `a.py@X=1`, optionally prefixed `<i>:`).
 """
 from __future__ import annotations
 
 import concurrent.futures as cf
-import json
 import re
 import shlex
 import time
@@ -25,7 +23,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ledger, runner
+from . import runner
 from .config import Config
 
 CHECK_LINE = re.compile(r"^CHECK \S+ (\S+) \S+: (PASS|FAIL)")
@@ -100,7 +98,7 @@ class Sweep:
     def __init__(self, cfg: Config, console: Console, *, track: Path, extra: list[Path], cands: list[str],
                  best: str | None, bench: str, compile_tpl: str | None, check_flag: str, correct_args: str,
                  quick_args: str, full_args: str, top_k: int, noise: float, note: str, timeout_s: float | None,
-                 force: bool):
+                 cache: bool | None = None):
         self.cfg, self.con = cfg, console
         self.track, self.extra = track, extra
         self.cands = [Cand(t) for t in dict.fromkeys(cands) if t != best]
@@ -108,7 +106,7 @@ class Sweep:
         self.bench, self.compile_tpl = bench, compile_tpl
         self.check_flag, self.correct_args = check_flag, correct_args
         self.quick_args, self.full_args = quick_args, full_args
-        self.top_k, self.noise, self.timeout_s, self.force = top_k, noise, timeout_s, force
+        self.top_k, self.noise, self.timeout_s, self.cache = top_k, noise, timeout_s, cache
         self.id = "sw-" + time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:4]
         self.note = f"[{self.id}] {note}".strip()
         self.cost = 0.0
@@ -122,7 +120,7 @@ class Sweep:
 
     def job(self, cmd: str, *, mode: str = "gpu", fidelity: str = "timing", stage: str) -> dict:
         sub = runner.submit(self.cfg, self.con, track=self.track, extra=self.extra, cmd=cmd, mode=mode,
-                            force=self.force, note=f"{self.note} · {stage}", timeout_s=self.timeout_s,
+                            cache=self.cache, note=f"{self.note} · {stage}", timeout_s=self.timeout_s,
                             fidelity=fidelity)
         r = sub if sub["status"] != "queued" else runner.wait(self.cfg, Console(stderr=True, quiet=True), sub["id"],
                                                               stream=False)
@@ -145,7 +143,7 @@ class Sweep:
             c.stage = "compile"
             cmd = self.compile_tpl.replace("{file}", shlex.quote(c.token.split("@")[0]))
             subs[c.token] = runner.submit(self.cfg, self.con, track=self.track, extra=self.extra, cmd=cmd, mode="cpu",
-                                          force=self.force, note=f"{self.note} · compile", timeout_s=self.timeout_s)
+                                          cache=self.cache, note=f"{self.note} · compile", timeout_s=self.timeout_s)
         with cf.ThreadPoolExecutor(max(1, len(subs))) as ex:
             futs = {ex.submit(lambda s: s if s["status"] != "queued" else runner.wait(self.cfg, quiet, s["id"],
                                                                                       stream=False), s): t

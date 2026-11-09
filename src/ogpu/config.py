@@ -13,76 +13,63 @@ STATE_PATH = HOME / "state.json"
 LEDGER_PATH = HOME / "ledger.db"
 LOG_DIR = HOME / "logs"
 
-REMOTE_ROOT = "/workspace/okc"      # synced tracks live here on the pod
-REMOTE_OGPU = "/workspace/.ogpu"    # jobs/, lock_holder.json, bin/, reaper state
+REMOTE_OGPU = "/workspace/.ogpu"    # jobs/, runs/, bin/, reaper state
 
 DEFAULT_CONFIG = """\
-# ogpu config. Secrets (RUNPOD_API_KEY) come from the environment.
-pod_name = "ogpu-h200"
-image = "lmsysorg/sglang:dev-muse-spark-open"
-gpu_type_ids = ["NVIDIA H200"]        # = H200 SXM (the judge GPU). Not "NVIDIA H200 NVL". `ogpu gpus` lists ids
-cloud_types = ["COMMUNITY", "SECURE"]  # tried in order; community H200 SXM ~$1.70/hr cheaper
-container_disk_gb = 60
-volume_gb = 100                        # pod volume at /workspace, survives stop/resume
-network_volume_id = ""                 # optional: RunPod network volume (pins the datacenter)
-min_vcpu = 8
-min_memory_gb = 32
-ssh_public_key = "~/.ssh/id_ed25519.pub"
-ssh_private_key = "~/.ssh/id_ed25519"
-idle_minutes = 20                      # on-pod reaper stops the pod after this much idle time
-budget_usd = 60.0                      # daily cap: `ogpu run --gpu` refuses new work beyond it
-auto_up = true                         # `ogpu run` resumes/creates the pod if it is not running
-quiet_timing = true                    # CPU jobs run niced on non-reserved cores so they can't disturb GPU timings
-recreate_on_resume_failure = true      # stopped pod's host has no free GPU → create a new pod instead of failing
-default_timeout_s = 3600               # jobs without --timeout are killed after this long
-hang_factor = 5                        # hang = running > factor × this command's usual (p90) runtime, log quiet
-hang_floor_s = 180                     # ...but never flag a job as hung before this many seconds
-spin_silent_s = 900                    # GPU at ~100% util on low power with a silent log this long = deadlock
-min_cuda = "13.0"                      # only hosts whose driver supports this CUDA (the image's torch is cu130)
+# ogpu config. API keys come from the environment (RUNPOD_API_KEY, VAST_API_KEY; Modal uses `modal token`).
+provider = "runpod"          # runpod | vast | modal | ssh | your own under [providers.<name>]
+gpu_type_ids = []            # provider-native GPU ids, tried in order ([] = provider default; `ogpu gpus` lists ids)
+image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
+idle_minutes = 10            # the machine stops itself after this much idle time
+budget_usd = 25.0            # daily cap: new GPU jobs are refused beyond it
+cache = false                # true: an identical run (same sources + command) returns the earlier result for free
+profile = ""                 # "okc": Open Kernel Challenge defaults (judge image, H200 + H100 correctness pool)
 
-# Pools: the settings above are the `timing` pool. Other pools override any of them.
-[pools.correctness]                    # `--fidelity correctness` jobs: cheap GPUs with the same ISA (sm_90a, like H200)
-# 132-SM parts first (same SM count as H200 → same launch configs); 114-SM PCIe last
-gpu_type_ids = ["NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"]
-idle_minutes = 10
+# A cheaper pool for `--fidelity correctness` jobs (any provider), e.g.:
+# [pools.correctness]
+# provider = "modal"
+# gpu_type_ids = ["L4"]
 """
 
 POOLS = ("timing", "correctness")
 CUDA_VERSIONS = ["12.4", "12.5", "12.6", "12.7", "12.8", "12.9", "13.0", "13.1", "13.2", "13.3"]
-DEFAULT_POOLS = {"correctness": {"gpu_type_ids": ["NVIDIA H100 NVL", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe"],
-                                 "idle_minutes": 10}}
 
 
 @dataclass
 class Config:
-    pod_name: str = "ogpu-h200"
-    image: str = "lmsysorg/sglang:dev-muse-spark-open"
-    gpu_type_ids: list[str] = field(default_factory=lambda: ["NVIDIA H200"])
-    cloud_types: list[str] = field(default_factory=lambda: ["COMMUNITY", "SECURE"])
-    container_disk_gb: int = 60
-    volume_gb: int = 100
+    provider: str = "runpod"
+    profile: str = ""
+    pod_name: str = "ogpu"
+    image: str = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
+    gpu_type_ids: list[str] = field(default_factory=list)   # [] = the provider's default
+    cloud_types: list[str] = field(default_factory=list)    # provider tiers; [] = the provider's default
+    container_disk_gb: int = 50
+    volume_gb: int = 50
     network_volume_id: str = ""
     min_vcpu: int = 8
     min_memory_gb: int = 32
     ssh_public_key: str = "~/.ssh/id_ed25519.pub"
     ssh_private_key: str = "~/.ssh/id_ed25519"
-    idle_minutes: int = 20
-    budget_usd: float = 60.0
+    idle_minutes: int = 10
+    budget_usd: float = 25.0
     auto_up: bool = True
+    cache: bool = False
     quiet_timing: bool = True
     recreate_on_resume_failure: bool = True
     default_timeout_s: float = 3600
     hang_factor: float = 5
     hang_floor_s: float = 180
     spin_silent_s: float = 900
-    min_cuda: str = "13.0"
+    min_cuda: str = "12.4"
+    remote_root: str = "/workspace/src"   # synced dirs live here on the machine
     pools: dict = field(default_factory=dict)
+    providers: dict = field(default_factory=dict)  # [providers.<name>]: options, or module = "pkg.mod:Class"
 
     def pool(self, name: str) -> "Config | None":
-        """The config for one pool: `timing` is the top level; others override it. None if disabled."""
+        """The config for one pool: `timing` is the top level; others override it. None if not configured."""
         if name == "timing":
             return self
-        over = dict(DEFAULT_POOLS.get(name, {})) | dict(self.pools.get(name, {}))
+        over = dict(self.pools.get(name, {}))
         if not over or over.pop("enabled", True) is False:
             return None
         known = Config.__dataclass_fields__
@@ -91,7 +78,7 @@ class Config:
 
     @property
     def allowed_cuda_versions(self) -> list[str] | None:
-        """RunPod's host filter wants an explicit list: every known CUDA version ≥ min_cuda."""
+        """Host filters want an explicit list: every known CUDA version ≥ min_cuda."""
         if not self.min_cuda:
             return None
         key = lambda v: tuple(int(x) for x in v.split("."))  # noqa: E731
@@ -106,20 +93,29 @@ class Config:
         return str(Path(self.ssh_private_key).expanduser())
 
 
+def profile_defaults(name: str) -> dict:
+    if not name:
+        return {}
+    if name == "okc":
+        from . import okc
+        return okc.DEFAULTS
+    raise SystemExit(f"unknown profile {name!r} in {CONFIG_PATH} (known: okc)")
+
+
+def ensure_home() -> None:
+    HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
 def load_config() -> Config:
-    HOME.mkdir(parents=True, exist_ok=True)
+    ensure_home()
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(DEFAULT_CONFIG)
     data = tomllib.loads(CONFIG_PATH.read_text())
+    base = profile_defaults(data.get("profile", ""))
+    pools = {n: dict(base.get("pools", {}).get(n, {})) | p for n, p in data.get("pools", {}).items()}
+    merged = base | data | {"pools": dict(base.get("pools", {})) | pools}
     known = Config.__dataclass_fields__
-    return Config(**{k: v for k, v in data.items() if k in known})
-
-
-def api_key() -> str:
-    key = os.environ.get("RUNPOD_API_KEY", "")
-    if not key:
-        raise SystemExit("RUNPOD_API_KEY is not set (export it in your shell profile).")
-    return key
+    return Config(**{k: v for k, v in merged.items() if k in known})
 
 
 @dataclass
@@ -130,6 +126,8 @@ class State:
     cost_per_hr: float = 0.0
     gpu: str = ""
     cloud: str = ""
+    provider: str = ""
+    user: str = "root"
 
     @property
     def reachable(self) -> bool:
@@ -139,8 +137,7 @@ class State:
 def _read_states() -> dict:
     if not STATE_PATH.exists():
         return {}
-    raw = json.loads(STATE_PATH.read_text())
-    return raw.get("pools", {}) if "pools" in raw else {"timing": raw}  # pre-pool state files = timing pool
+    return json.loads(STATE_PATH.read_text()).get("pools", {})
 
 
 def load_state(pool: str = "timing") -> State:
@@ -149,7 +146,7 @@ def load_state(pool: str = "timing") -> State:
 
 
 def save_state(s: State, pool: str = "timing") -> None:
-    HOME.mkdir(parents=True, exist_ok=True)
+    ensure_home()
     states = _read_states()
     states[pool] = asdict(s)
     tmp = STATE_PATH.with_suffix(".tmp")

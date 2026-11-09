@@ -1,4 +1,4 @@
-"""SQLite ledger of every run + content-hash cache + metric parsing for the OKC bench scripts."""
+"""SQLite ledger of every run + the opt-in content-hash cache + metric parsing."""
 from __future__ import annotations
 
 import fnmatch
@@ -30,12 +30,12 @@ create table if not exists sessions (
 
 # columns added after v0; connect() adds them to existing ledgers
 EXTRA_COLUMNS = {"track_path": "text", "note": "text", "failure": "text", "error": "text", "timeout_s": "real",
-                 "submitted": "real", "extra_paths": "text",
-                 "pool": "text"}
+                 "submitted": "real", "extra_paths": "text", "pool": "text",
+                 "handle": "text"}  # serverless jobs: how to find the launcher again (pid, results path)
 
 
 def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
@@ -71,53 +71,31 @@ def content_key(roots: list[Path], cmd: str, mode: str, image: str) -> str:
     return h.hexdigest()
 
 
-SCORE = re.compile(r"^SCORE (\S+): ([\d.]+)")
-CHECK = re.compile(r"^CHECK (\S+) (\S+) (\S+): (PASS|FAIL)")
-ERR = re.compile(r"relative L2 error ([\d.e+-]+)[^\[]*\[bound ([\d.e+-]+)")
-CHECKS = re.compile(r"^CHECKS: (ALL PASS|(\d+) FAIL)")
-SIDE = re.compile(r"^SIDE (\S+): (\{.*\})\s*$")
 METRIC = re.compile(r"^OGPU_METRIC (\w+)=(\S+)")
 
 
-def parse_metrics(log: str) -> dict:
-    """Pull the headline numbers out of pod/bench.py, pair_bench.py, and any `OGPU_METRIC k=v` lines."""
+def parse_metrics(log: str, profile: str = "") -> dict:
+    """`OGPU_METRIC name=value` lines from any script (print `OGPU_METRIC score=<x>` to rank runs by it), plus the
+    profile's own bench format (profile = "okc")."""
     m: dict = {}
-    fails = passes = 0
+    if profile == "okc":
+        from . import okc
+        m = okc.parse(log)
     for line in log.splitlines():
-        line = line.strip()
-        if r := SCORE.match(line):
-            m.setdefault("score", {})[r[1]] = float(r[2])
-        elif r := CHECK.match(line):
-            passes += r[4] == "PASS"
-            fails += r[4] == "FAIL"
-            for err, bound in ERR.findall(line):  # how close to the judge's bound (1.0 = at the bound)
-                try:
-                    ratio = float(err) / float(bound)
-                except (ValueError, ZeroDivisionError):
-                    continue
-                m["check_margin"] = max(m.get("check_margin", 0.0), round(ratio, 4))
-        elif r := CHECKS.match(line):
-            m["checks"] = "PASS" if r[1] == "ALL PASS" else "FAIL"
-        elif r := SIDE.match(line):
-            try:
-                m.setdefault("sides", {})[r[1]] = json.loads(r[2])
-            except ValueError:
-                pass
-        elif r := METRIC.match(line):
+        if r := METRIC.match(line.strip()):
             try:
                 m[r[1]] = float(r[2])
             except ValueError:
                 m[r[1]] = r[2]
-    if passes or fails:
-        m["check_pass"], m["check_fail"] = passes, fails
-        m.setdefault("checks", "FAIL" if fails else "PASS")
     return m
 
 
 def headline(metrics: dict) -> str:
     """One short human string, e.g. 'best 1.0831× · checks PASS'."""
     parts = []
-    if metrics.get("score"):
+    if isinstance(metrics.get("score"), (int, float)):
+        parts.append(f"score {metrics['score']:.4g}")
+    elif metrics.get("score"):
         name, v = max(metrics["score"].items(), key=lambda kv: kv[1])
         parts.append(f"{name} {v:.4f}×")
     for k, s in (metrics.get("sides") or {}).items():
@@ -168,7 +146,8 @@ def usual_runtime(db: sqlite3.Connection, track: str, cmd: str, pool: str, last:
 
 
 def best_score(metrics: dict) -> float | None:
-    vals = list((metrics.get("score") or {}).values())
+    score = metrics.get("score")
+    vals = [score] if isinstance(score, (int, float)) else list((score or {}).values())
     vals += [s["ratio_vs_s0"] for s in (metrics.get("sides") or {}).values() if s.get("ratio_vs_s0")]
     return max(vals) if vals else None
 
@@ -210,8 +189,10 @@ def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_pe
 
 
 def spend(db: sqlite3.Connection, since: float = 0.0) -> float:
-    """$ spent in sessions that ended after `since` (clipped to `since`)."""
-    total = 0.0
+    """$ spent in machine sessions that ended after `since` (clipped to `since`), plus serverless jobs (billed per
+    job, no machine session)."""
+    total = db.execute("select coalesce(sum(cost_usd), 0) c from runs where backend = 'modal' and ended > ?",
+                       (since,)).fetchone()["c"]
     for s in db.execute("select * from sessions"):
         start, end = s["start"], s["start"] + s["uptime_s"]
         if end > since:
@@ -243,7 +224,7 @@ def utilization(db: sqlite3.Connection, since: float = 0.0) -> dict:
             sessions.append((a, b, s["cost_per_hr"]))
             paid_cost += (b - a) / 3600 * s["cost_per_hr"]
     spans = _union([(a, b) for a, b, _ in sessions])
-    rows = db.execute("select mode, started, ended from runs where backend='runpod' and started is not null "
+    rows = db.execute("select mode, started, ended from runs where backend not in ('cache','modal') and started is not null "
                       "and ended is not null and ended > ?", (since,)).fetchall()
     gpu = _union([(r["started"], r["ended"]) for r in rows if r["mode"] == "gpu"])
     busy = _union([(r["started"], r["ended"]) for r in rows])

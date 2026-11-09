@@ -59,7 +59,7 @@ def test_full_tournament_flow(monkeypatch, tmp_path):
     run = sweep.Sweep(config.Config(), Console(quiet=True), track=Path("."), extra=[],
                       cands=["a.py", "b.py", "c.py", "d.py", "bad.py"], best="best.py", bench="python3 pod/bench.py",
                       compile_tpl=None, check_flag="--check", correct_args="--reps 3", quick_args="--reps 5",
-                      full_args="--reps 20", top_k=2, noise=0.015, note="test", timeout_s=None, force=False)
+                      full_args="--reps 20", top_k=2, noise=0.015, note="test", timeout_s=None)
     rep = run.run()
     assert [c[0] for c in calls] == ["correctness", "quick", "full"]
     assert calls[0][1] == "correctness" and "best.py" not in calls[0][2]   # best isn't re-checked
@@ -82,5 +82,5 @@ def test_no_winner_when_inside_noise(monkeypatch, tmp_path):
     monkeypatch.setattr(sweep.Sweep, "job", fake_job)
     rep = sweep.Sweep(config.Config(), Console(quiet=True), track=Path("."), extra=[], cands=["a.py"], best="best.py",
                       bench="b", compile_tpl=None, check_flag="--check", correct_args="", quick_args="", full_args="",
-                      top_k=2, noise=0.015, note="", timeout_s=None, force=False).run()
+                      top_k=2, noise=0.015, note="", timeout_s=None).run()
     assert rep["recommend"] is None and "no candidate beat" in rep["verdict"]

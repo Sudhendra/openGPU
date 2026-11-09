@@ -27,9 +27,10 @@ def test_parse_health():
 
 
 def test_allowed_cuda_versions():
-    assert config.Config().allowed_cuda_versions[0] == "13.0" and "12.8" not in config.Config().allowed_cuda_versions
+    cfg = config.Config(min_cuda="13.0", pools={"correctness": {"idle_minutes": 5}})
+    assert cfg.allowed_cuda_versions[0] == "13.0" and "12.8" not in cfg.allowed_cuda_versions
     assert config.Config(min_cuda="").allowed_cuda_versions is None
-    assert config.Config().pool("correctness").allowed_cuda_versions == config.Config().allowed_cuda_versions
+    assert cfg.pool("correctness").allowed_cuda_versions == cfg.allowed_cuda_versions
 
 
 def test_reaper_alive():
@@ -131,8 +132,9 @@ def test_correctness_submit_failure_falls_back_to_timing(monkeypatch, tmp_path):
 
     monkeypatch.setattr(runner, "push_and_start", fake_push_and_start)
     (tmp_path / "t").mkdir()
-    r = runner.submit(config.Config(budget_usd=1e9), Console(quiet=True), track=tmp_path / "t", extra=[], cmd="x",
-                      mode="gpu", force=True, fidelity="correctness")
+    from ogpu import okc
+    r = runner.submit(config.Config(budget_usd=1e9, pools=okc.DEFAULTS["pools"]), Console(quiet=True), track=tmp_path / "t", extra=[], cmd="x",
+                      mode="gpu", fidelity="correctness")
     assert tried == ["correctness", "timing"] and r["status"] == "queued"
     row = real(tmp_path / "l.db").execute("select pool from runs where id=?", (r["id"],)).fetchone()
     assert row[0] == "timing"

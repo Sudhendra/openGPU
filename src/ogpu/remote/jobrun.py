@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
-"""On-pod job runner (stdlib only; copied to /workspace/.ogpu/bin by `ogpu up`).
+"""On-machine job runner (stdlib only; copied to /workspace/.ogpu/bin by `ogpu up`).
 
   jobrun.py start <job.json b64>   register a job and run it detached (survives SSH drops)
   jobrun.py poll <id> <offset>     JSON: status, queue position, lock holder, log bytes from offset
   jobrun.py snapshot               JSON: all recent jobs + lock holder + reaper state (for `ogpu top`)
   jobrun.py cancel <id>            kill a job's process group
 
-GPU jobs serialize on an flock over /tmp/h200.lock so timings from different agents never overlap; CPU jobs
+GPU jobs serialize on an flock over /tmp/ogpu-gpu.lock so timings from different agents never overlap; CPU jobs
 (ptxas/nvcc gates) run immediately and in parallel.
 """
 import base64
 import fcntl
 import json
 import os
+import re
+import shlex
 import signal
 import subprocess
 import sys
@@ -20,15 +22,20 @@ import time
 
 OG = "/workspace/.ogpu"
 JOBS = f"{OG}/jobs"
-LOCK = "/tmp/h200.lock"
+LOCK = "/tmp/ogpu-gpu.lock"
 HOLDER = f"{OG}/lock_holder.json"
 ACTIVITY = f"{OG}/last_activity"
 RECENT_S = 6 * 3600
-RUNS = "/workspace/okc/.runs"   # per-job snapshots: a queued job never sees code pushed after it was submitted
+RUNS = f"{OG}/runs"   # per-job snapshots: a queued job never sees code pushed after it was submitted
 KEEP_RUNS_S = 24 * 3600
 
 
+JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+
 def jpath(jid, ext="json"):
+    if not JOB_ID.match(jid) or ".." in jid:  # ids end up in file paths
+        raise SystemExit(f"bad job id {jid!r}")
     return f"{JOBS}/{jid}.{ext}"
 
 
@@ -142,6 +149,7 @@ def holder():
 
 def cmd_start(spec_b64):
     job = json.loads(base64.b64decode(spec_b64))
+    jpath(job["id"])  # validate before it is used in any path
     os.makedirs(JOBS, exist_ok=True)
     prune_runs()
     run_dir = f"{RUNS}/{job['id']}"
@@ -264,7 +272,7 @@ def cmd_exec(jid):
     exports = " ".join(f"{k}={v}" for k, v in env_over.items())
     # env.sh first (container env), then our overrides so they win; a user's own MAX_JOBS in the cmd still wins
     shell = (f"[ -f {OG}/env.sh ] && source {OG}/env.sh; export {exports}; "
-             f"cd {json.dumps(job['cwd'])} && {job['cmd']}")
+             f"cd {shlex.quote(job['cwd'])} && {job['cmd']}")
 
     def limit():
         if cores and hasattr(os, "sched_setaffinity"):

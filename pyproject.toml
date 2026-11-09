@@ -1,7 +1,7 @@
 [project]
 name = "ogpu"
 version = "0.1.0"
-description = "Personal H200 broker + shared bench service for GPU kernel hill-climbing with coding agents"
+description = "GPU savings engine for coding agents: cheapest capable GPU across RunPod, Vast.ai and Modal, shared safely, never paid for idle"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""On-pod idle reaper (stdlib only). Stops this pod via the RunPod API once no job has been queued or running for
-`idle_minutes`. Stopping keeps /workspace (code, compiled-extension cache, job history); `ogpu up` resumes it."""
+"""On-machine idle reaper (stdlib only). Stops this machine through its provider once no job has been queued or
+running for `idle_minutes`. Stopping keeps /workspace (code, compiled-extension cache, job history); `ogpu up`
+resumes it. config.json (written by `ogpu up`): idle_minutes, machine_id, provider, optional stop_cmd."""
 import json
 import os
 import signal
@@ -8,6 +9,7 @@ import subprocess
 import sys
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -82,32 +84,25 @@ def watchdog(now=None, gpu=None):
             jobrun.kill_group(j["pid"], signal.SIGTERM)
 
 
-def idle_minutes():
+def load_cfg():
     try:
         with open(f"{OG}/config.json") as f:
-            return float(json.load(f).get("idle_minutes", 20))
+            return json.load(f)
     except (OSError, ValueError):
+        return {}
+
+
+def idle_minutes():
+    try:
+        return float(load_cfg().get("idle_minutes", 20))
+    except (TypeError, ValueError):
         return 20.0
 
 
 def busy():
-    if jobrun is not None:  # reconcile closes records left by an earlier container (recycled pids) and dead runners
-        return any(jobrun.reconcile(j)["status"] in ("queued", "running")
-                   for j in jobrun.all_jobs() if j["status"] in ("queued", "running"))
-    for n in os.listdir(f"{OG}/jobs"):
-        if n.endswith(".json"):
-            try:
-                with open(f"{OG}/jobs/{n}") as f:
-                    j = json.load(f)
-            except (OSError, ValueError):
-                continue
-            if j.get("status") in ("queued", "running"):
-                try:
-                    os.kill(j.get("runner_pid"), 0)
-                    return True
-                except (OSError, TypeError):
-                    pass
-    return False
+    # reconcile closes records left by an earlier container (recycled pids) and dead runners
+    return any(jobrun.reconcile(j)["status"] in ("queued", "running")
+               for j in jobrun.all_jobs() if j["status"] in ("queued", "running"))
 
 
 def last_activity():
@@ -137,20 +132,46 @@ def log_session_end():
     if start is None:
         return
     with open(f"{OG}/sessions.jsonl", "a") as f:
-        f.write(json.dumps({"pod_id": os.environ.get("RUNPOD_POD_ID"), "start": start, "end": time.time()}) + "\n")
+        machine = load_cfg().get("machine_id") or os.environ.get("RUNPOD_POD_ID") or os.environ.get("CONTAINER_ID")
+        f.write(json.dumps({"pod_id": machine, "start": start, "end": time.time()}) + "\n")
+
+
+def http(method, url, key, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), method=method,
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"})
+    return urllib.request.urlopen(req, timeout=30).read()[:200]
+
+
+def stop_runpod():
+    pod, key = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")  # pod-scoped key, set by RunPod
+    if not (pod and key):
+        return "no RUNPOD_POD_ID/RUNPOD_API_KEY"
+    q = {"query": 'mutation { podStop(input: {podId: %s}) { id } }' % json.dumps(pod)}
+    try:
+        out = http("POST", "https://api.runpod.io/graphql", key, q)
+        if b'"errors"' not in out:
+            return out
+    except urllib.error.HTTPError:
+        pass
+    # a key the header form rejects may still work as a query parameter (TLS, straight to RunPod): the stop matters
+    return http("POST", "https://api.runpod.io/graphql?" + urllib.parse.urlencode({"api_key": key}), key, q)
+
+
+def stop_vast():
+    inst, key = os.environ.get("CONTAINER_ID"), os.environ.get("CONTAINER_API_KEY")  # per-instance key, set by Vast
+    if not (inst and key):
+        return "no CONTAINER_ID/CONTAINER_API_KEY"
+    return http("PUT", f"https://console.vast.ai/api/v0/instances/{int(inst)}/", key, {"state": "stopped"})
 
 
 def stop_pod():
-    pod, key = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
-    if pod and key:
-        q = json.dumps({"query": f'mutation {{ podStop(input: {{podId: "{pod}"}}) {{ id }} }}'}).encode()
-        req = urllib.request.Request("https://api.runpod.io/graphql?" + urllib.parse.urlencode({"api_key": key}),
-                                     data=q, headers={"Content-Type": "application/json"})
-        print(time.ctime(), "stopping pod", pod, urllib.request.urlopen(req, timeout=30).read()[:200], flush=True)
-    elif pod:
-        subprocess.run(["runpodctl", "stop", "pod", pod])
+    cfg = load_cfg()
+    if cfg.get("stop_cmd"):
+        out = subprocess.run(["bash", "-c", cfg["stop_cmd"]], capture_output=True, text=True).returncode
     else:
-        print(time.ctime(), "no RUNPOD_POD_ID; cannot stop", flush=True)
+        stop = {"runpod": stop_runpod, "vast": stop_vast}.get(cfg.get("provider", "runpod"))
+        out = stop() if stop else f"provider {cfg.get('provider')!r} has no self-stop; set stop_cmd"
+    print(time.ctime(), "stopping machine:", out, flush=True)
 
 
 def single_instance():

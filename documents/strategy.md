@@ -5,7 +5,7 @@
 2. *The fundamental core is a **savings engine**: optimization loops and queues that move work around with one goal, maximal savings, and prove how much was saved compared with not using the tool.*
 3. *What gets sold comes after (a deep financial analysis later).*
 
-Related: [`platform-plan.md`](platform-plan.md) (suppliers, revenue overview), [`roadmap.md`](roadmap.md), [`feasibility-analysis.md`](feasibility-analysis.md).
+Related: [`platform-plan.md`](platform-plan.md) (suppliers, revenue overview), [`feasibility-analysis.md`](feasibility-analysis.md).
 
 ---
 
