@@ -1,6 +1,7 @@
 """~/.ogpu/config.toml + ~/.ogpu/state.json. Secrets come from the environment, never the config file."""
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import tomllib
@@ -21,8 +22,8 @@ provider = "runpod"          # runpod | modal | ssh | your own under [providers.
 gpu_type_ids = []            # provider-native GPU ids, tried in order ([] = provider default; `ogpu gpus` lists ids)
 image = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"
 idle_minutes = 10            # the machine stops itself after this much idle time
-budget_usd = 25.0            # daily cap: new GPU jobs are refused beyond it
-cache = false                # true: an identical run (same sources + command) returns the earlier result for free
+budget_usd = 25.0            # daily cap: new jobs (GPU or CPU, any provider) are refused beyond it
+cache = false                # true: an identical run (same files + command + image + GPU) returns the earlier result
 profile = ""                 # "okc": Open Kernel Challenge defaults (judge image, H200 + H100 correctness pool)
 
 # A cheaper pool for `--fidelity correctness` jobs (any provider), e.g.:
@@ -106,11 +107,26 @@ def ensure_home() -> None:
     HOME.mkdir(mode=0o700, parents=True, exist_ok=True)
 
 
+def check_keys(data: dict, where: str) -> None:
+    """A typo (`budget = 5` for `budget_usd`) must not silently fall back to a default — least of all the budget."""
+    known = set(Config.__dataclass_fields__) | ({"enabled"} if where != "top level" else set())
+    for k in data:
+        if k not in known:
+            near = difflib.get_close_matches(k, known, n=1)
+            raise SystemExit(f"unknown config key {k!r} ({where} of {CONFIG_PATH})"
+                             + (f" — did you mean {near[0]!r}?" if near else ""))
+
+
 def load_config() -> Config:
     ensure_home()
     if not CONFIG_PATH.exists():
         CONFIG_PATH.write_text(DEFAULT_CONFIG)
     data = tomllib.loads(CONFIG_PATH.read_text())
+    check_keys(data, "top level")
+    for name, pool in data.get("pools", {}).items():
+        if name not in POOLS:
+            raise SystemExit(f"unknown pool {name!r} in {CONFIG_PATH} (pools: {', '.join(POOLS)})")
+        check_keys(pool, f"[pools.{name}]")
     base = profile_defaults(data.get("profile", ""))
     pools = {n: dict(base.get("pools", {}).get(n, {})) | p for n, p in data.get("pools", {}).items()}
     merged = base | data | {"pools": dict(base.get("pools", {})) | pools}

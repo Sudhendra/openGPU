@@ -15,8 +15,8 @@
 | **Cheapest capable GPU** | Pick the provider per pool, list GPU types and tiers in your price order (`ogpu gpus` shows prices), and ogpu falls back down the list on capacity errors. A broken or too-old host is detected by a real GPU allocation and replaced before any agent gets it. |
 | **Multi-fidelity** | `--fidelity correctness` jobs go to a cheaper pool (e.g. Modal L4s) so the expensive target GPU only times candidates that are already correct. `ogpu sweep` runs a whole tournament this way. |
 | **Batch & share** | GPU jobs queue behind an exclusive lock so timings never overlap; CPU jobs (compile gates) run in parallel at low priority, sized to the container's real CPU quota. Every job runs from its own code snapshot. |
-| **Opt-in result cache** | With `cache = true` (or `--cache`), an identical run (same sources + command + image) returns the earlier result for $0, and identical in-flight jobs from different agents are deduplicated. |
-| **Cost visibility** | `ogpu cost` / `ogpu top`: spend, GPU-busy % of paid time, idle dollars, spend per agent. A daily budget cap refuses new GPU work beyond it. |
+| **Opt-in result cache** | With `cache = true` (or `--cache`), an identical run (same synced files + command + image + provider and GPU types) returns the earlier result for $0, and identical in-flight jobs from different agents are deduplicated. Only passes and failures the code itself causes are replayed; infrastructure failures (launch errors, timeouts, hangs, OOM, CUDA errors) are always re-run. |
+| **Cost visibility** | `ogpu cost` / `ogpu top`: spend, GPU-busy % of paid time, idle dollars, spend per agent. A daily budget cap refuses every new job beyond it (GPU or CPU, `run`, `submit`, `sweep`, `fanout`); Modal jobs count while still running, including ones nobody waited on. |
 | **Agent-native** | One-line JSON results, failure classification with error excerpts, async `submit`/`wait`, meaningful exit codes, a drop-in agent skill and guard hook. |
 
 ## Quickstart
@@ -76,7 +76,7 @@ With `--json`, every run ends with one line:
 | Provider | Kind | Key | Notes |
 |---|---|---|---|
 | `runpod` | machine | `RUNPOD_API_KEY` | Tiers `COMMUNITY`, `SECURE`. Host CUDA filter from `min_cuda`. |
-| `modal` | serverless | `modal token new` | One container per job, per-second billing, nothing to stop. GPU ids: `H200`, `H100`, `A100-80GB`, `L40S`, `L4`, … |
+| `modal` | serverless | `modal token new` | One container per job, per-second billing, nothing to stop. GPU ids: `H200`, `H100`, `A100-80GB`, `L40S`, `L4`, `T4`, … Each container gets `[providers.modal] cpu = 2` cores and `memory_gb = 8` (billed too: raise only if needed). |
 | `ssh` | machine | — | A host you already have: `[providers.ssh] host/port/user/cost_per_hr/stop_cmd`. |
 
 Set `provider` at the top level and override it per pool, e.g. timing on RunPod H100s, correctness on Modal L4s:
@@ -107,7 +107,7 @@ region = "us-east"                  # other keys are passed to the provider as `
 | `cloud_types` | provider default | Provider tiers, tried in order |
 | `image` | `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel` | Any image with `python3` |
 | `idle_minutes` | `10` | The machine stops itself after this much idle time |
-| `budget_usd` | `25` | Daily cap. New GPU jobs are refused beyond it. |
+| `budget_usd` | `25` | Daily cap. New jobs are refused beyond it. |
 | `cache` | `false` | Reuse identical runs (`--cache/--no-cache` per run) |
 | `min_cuda` | `12.4` | Only hosts whose driver supports this CUDA |
 | `profile` | `""` | `"okc"`: Open Kernel Challenge preset (below) |
@@ -115,7 +115,7 @@ region = "us-east"                  # other keys are passed to the provider as `
 | `auto_up` / `quiet_timing` | `true` / `true` | Bring machines up on demand / keep CPU jobs off the timing cores |
 | `[pools.correctness]` | none | Any of the keys above, for `--fidelity correctness` jobs |
 
-Environment: provider keys, `OGPU_AGENT` (label in the ledger), `OGPU_HOME` (default `~/.ogpu`), `OGPU_NO_NOTIFY`.
+Unknown keys are rejected (a typo never falls back to a default). Environment: provider keys, `OGPU_AGENT` (label in the ledger), `OGPU_HOME` (default `~/.ogpu`), `OGPU_NO_NOTIFY`.
 
 ### Profiles
 `profile = "okc"` presets ogpu for the Open Kernel Challenge: the judge image on an H200 timing pool, an H100 correctness pool, `min_cuda = 13.0`, and the OKC bench output (`SCORE`, `CHECK`, `CHECKS`, `SIDE` lines) parsed into metrics. Anything you set in the file still wins.

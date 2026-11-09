@@ -150,3 +150,86 @@ def test_pid_alive_reaps_own_finished_child():
     q = subprocess.Popen(["sleep", "5"])
     assert runner.pid_alive(q.pid) is True
     q.kill()
+
+
+def test_cache_key_includes_target_hardware(local_submit):
+    track, started, db = local_submit
+    con = Console(quiet=True)
+    h100 = config.Config(budget_usd=1e9, gpu_type_ids=["NVIDIA H100 80GB HBM3"])
+    first = runner.submit(h100, con, track=track, extra=[], cmd="x", mode="gpu", cache=True)
+    db.execute("update runs set status='done', exit_code=0, ended=1 where id=?", (first["id"],))
+    db.commit()
+    l4 = config.Config(budget_usd=1e9, provider="modal", gpu_type_ids=["L4"])
+    assert runner.submit(h100, con, track=track, extra=[], cmd="x", mode="gpu", cache=True).get("cached_from")
+    monkey_serverless = runner.start_serverless
+    runner.start_serverless = lambda *a: {"pid": 0, "results": "/nonexistent", "log": "", "gpu": "L4", "rate": 1.0}
+    try:
+        assert runner.submit(l4, con, track=track, extra=[], cmd="x", mode="gpu", cache=True)["status"] == "queued"
+    finally:
+        runner.start_serverless = monkey_serverless
+
+
+def test_cache_never_replays_infrastructure_failures(tmp_path):
+    db = ledger.connect(tmp_path / "l.db")
+    base = dict(agent="a", track="t", cmd="c", mode="gpu", backend="runpod", status="failed", exit_code=1, started=1,
+                ended=2, wall_s=1, cost_usd=0, metrics={}, log_path="", cached_from=None)
+    for i, failure in enumerate(("launch_error", "timeout", "hang", "oom", "cuda_error")):
+        ledger.record(db, id=f"x{i}", key="K", failure=failure, **base)
+    assert ledger.cached(db, "K") is None
+    ledger.record(db, id="y", key="K", failure="compile_error", **base)  # the code's own fault: replaying is fine
+    assert ledger.cached(db, "K")["id"] == "y"
+
+
+def test_config_typos_are_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "HOME", tmp_path)
+    monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "config.toml")
+    (tmp_path / "config.toml").write_text("budget = 1.0\n")
+    with pytest.raises(SystemExit, match="did you mean 'budget_usd'"):
+        config.load_config()
+    (tmp_path / "config.toml").write_text("[pools.correctness]\nprovder = 'modal'\n")
+    with pytest.raises(SystemExit, match="did you mean 'provider'"):
+        config.load_config()
+    (tmp_path / "config.toml").write_text("[pools.cheap]\nprovider = 'modal'\n")
+    with pytest.raises(SystemExit, match="unknown pool"):
+        config.load_config()
+    (tmp_path / "config.toml").write_text("[providers.modal]\ncpu = 1\n[pools.correctness]\nenabled = false\n")
+    assert config.load_config().providers == {"modal": {"cpu": 1}}  # provider options are free-form
+
+
+def test_budget_applies_to_cpu_jobs_and_in_flight_serverless(local_submit):
+    track, started, db = local_submit
+    now = time.time()
+    ledger.record(db, id="m", key=None, agent="a", track="t", cmd="c", mode="cpu", backend="modal", status="running",
+                  exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={}, log_path="",
+                  cached_from=None, submitted=now - 3600,
+                  handle=json.dumps({"pid": os.getpid(), "results": "/nonexistent", "log": "", "gpu": "none",
+                                     "rate": 2.0}))
+    assert ledger.spend(db, now - 86400) == pytest.approx(2.0, rel=0.01)  # still running: billed as it goes
+    with pytest.raises(runner.BudgetExceeded):
+        runner.submit(config.Config(budget_usd=1.5), Console(quiet=True), track=track, extra=[], cmd="x", mode="cpu")
+
+
+def test_unwaited_serverless_job_is_settled(local_submit, tmp_path):
+    track, started, db = local_submit
+    results = tmp_path / "res" / "results.json"
+    results.parent.mkdir()
+    (results.parent / "0.log").write_text("OGPU_METRIC score=3\n")
+    results.write_text(json.dumps([{"i": 0, "cmd": "x", "rc": 0, "wall_s": 10, "billed_s": 36, "ended": time.time(),
+                                    "log_path": str(results.parent / "0.log")}]))
+    ledger.record(db, id="s1", key=None, agent="a", track="t", cmd="x", mode="gpu", backend="modal", status="queued",
+                  exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
+                  log_path=str(tmp_path / "s1.log"), cached_from=None, track_path=str(track), submitted=time.time(),
+                  handle=json.dumps({"pid": 999999, "results": str(results), "log": "", "gpu": "T4", "rate": 1.0}))
+    runner.settle_serverless(config.Config(), db)
+    row = ledger.get(db, "s1")
+    assert row["status"] == "done" and row["cost_usd"] == pytest.approx(0.01)  # 36 billed seconds at $1/hr
+    assert json.loads(row["metrics"])["score"] == 3
+
+
+def test_modal_container_is_small_and_priced_in_full():
+    from ogpu.providers import modal
+    cfg = config.Config()
+    assert modal.container(cfg) == (2.0, 8)
+    assert modal.rate("T4", 2, 8) == pytest.approx(0.59 + 2 * 0.04716 + 8 * 0.007992, rel=1e-3)
+    big = config.Config(providers={"modal": {"cpu": 8, "memory_gb": 32}})
+    assert modal.rate("T4", *modal.container(big)) > 1.2  # CPU + memory can cost more than a small GPU

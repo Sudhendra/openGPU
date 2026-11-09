@@ -47,8 +47,14 @@ def test_content_key_tracks_sources_not_outputs(tmp_path):
     (tmp_path / "output").mkdir()
     k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     (tmp_path / "output" / "noise.log").write_text("ignored")
-    (tmp_path / "notes.md").write_text("ignored, not a source ext")
+    (tmp_path / "run.log").write_text("ignored")
+    (tmp_path / "a.pyc").write_bytes(b"ignored")
     assert ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img") == k1
+    (tmp_path / "data.csv").write_text("1,2\n")  # any synced file is an input, not just source extensions
+    k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
+    (tmp_path / "data.csv").write_text("1,3\n")
+    assert ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img") != k1
+    k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     (tmp_path / "submission.py").write_text("x = 2\n")
     k2 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     assert k2 != k1

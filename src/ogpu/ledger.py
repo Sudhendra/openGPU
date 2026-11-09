@@ -11,9 +11,13 @@ from pathlib import Path
 
 from .config import LEDGER_PATH
 
-SOURCE_EXTS = {".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".json", ".txt", ".toml", ".yaml", ".yml",
-               ".sh", ".ptx"}
+# the same things the sync leaves behind (ssh.EXCLUDES): everything else that is synced is an input to the run
 SKIP_DIRS = {".git", "output", "out", "profiles", "runs", "__pycache__", ".venv", "node_modules", ".pytest_cache"}
+SKIP_FILES = ("*.pyc", "*.log", ".DS_Store")
+HASH_MAX_BYTES = 64 << 20   # bigger files (datasets, checkpoints) are keyed by size + mtime instead of content
+# failures that the same inputs reproduce; anything else (launch_error, timeout, hang, oom, cuda_error, lost) may be
+# the machine's fault and must be re-run, never replayed from the cache
+CACHEABLE_FAILURES = ("compile_error", "import_error", "correctness_fail", "runtime_error")
 
 SCHEMA = """
 create table if not exists runs (
@@ -47,27 +51,32 @@ def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     return db
 
 
-def source_files(root: Path, excludes: list[str] = ()) -> list[Path]:
+def input_files(root: Path) -> list[Path]:
     out = []
     for p in sorted(root.rglob("*")):
         rel = p.relative_to(root)
-        if any(part in SKIP_DIRS for part in rel.parts) or not p.is_file() or p.suffix not in SOURCE_EXTS:
+        if any(part in SKIP_DIRS for part in rel.parts) or not p.is_file():
             continue
-        if any(fnmatch.fnmatch(str(rel), x) for x in excludes):
+        if any(fnmatch.fnmatch(p.name, x) for x in SKIP_FILES):
             continue
         out.append(p)
     return out
 
 
-def content_key(roots: list[Path], cmd: str, mode: str, image: str) -> str:
-    """Hash of every source file under the synced dirs + command + mode + image: identical inputs → identical key."""
+def content_key(roots: list[Path], cmd: str, mode: str, image: str, target: str = "") -> str:
+    """Hash of every synced file + command + mode + image + where it runs (provider and GPU types): identical inputs
+    on the same kind of hardware → identical key."""
     h = hashlib.sha256()
-    for k in (cmd, mode, image):
+    for k in (cmd, mode, image, target):
         h.update(k.encode() + b"\0")
     for root in roots:
-        for p in source_files(root):
+        for p in input_files(root):
             h.update(str(p.relative_to(root)).encode() + b"\0")
-            h.update(hashlib.sha256(p.read_bytes()).digest())
+            st = p.stat()
+            if st.st_size > HASH_MAX_BYTES:
+                h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+            else:
+                h.update(hashlib.sha256(p.read_bytes()).digest())
     return h.hexdigest()
 
 
@@ -113,9 +122,10 @@ IN_FLIGHT_S = 3 * 3600
 
 
 def cached(db: sqlite3.Connection, key: str):
-    """A finished run of the same inputs (lost/cancelled runs don't count: they measured nothing)."""
-    return db.execute("select * from runs where key=? and status in ('done','failed') and cached_from is null "
-                      "order by ended desc limit 1", (key,)).fetchone()
+    """A finished run of the same inputs: a pass, or a failure the inputs themselves cause (see CACHEABLE_FAILURES)."""
+    marks = ",".join("?" * len(CACHEABLE_FAILURES))
+    return db.execute(f"select * from runs where key=? and cached_from is null and (status='done' or (status='failed' "
+                      f"and failure in ({marks}))) order by ended desc limit 1", (key, *CACHEABLE_FAILURES)).fetchone()
 
 
 def in_flight(db: sqlite3.Connection, key: str):
@@ -193,6 +203,14 @@ def spend(db: sqlite3.Connection, since: float = 0.0) -> float:
     job, no machine session)."""
     total = db.execute("select coalesce(sum(cost_usd), 0) c from runs where backend = 'modal' and ended > ?",
                        (since,)).fetchone()["c"]
+    now = time.time()
+    # serverless jobs still in flight bill as they go: count them from submission (conservative: includes start-up)
+    for r in db.execute("select submitted, handle from runs where backend = 'modal' and status in ('queued','running')"):
+        try:
+            rate = json.loads(r["handle"])["rate"]
+        except (TypeError, ValueError, KeyError):
+            continue
+        total += max(0.0, now - max(r["submitted"] or now, since)) / 3600 * rate
     for s in db.execute("select * from sessions"):
         start, end = s["start"], s["start"] + s["uptime_s"]
         if end > since:

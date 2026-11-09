@@ -28,7 +28,8 @@ for d in [TRACK, *EXTRA]:
 cache = modal.Volume.from_name("ogpu-ext-cache", create_if_missing=True)
 
 
-@app.function(image=image, gpu=None if GPU == "none" else GPU, cpu=8, memory=32768,
+@app.function(image=image, gpu=None if GPU == "none" else GPU, cpu=float(os.environ.get("OGPU_MODAL_CPU") or 2),
+              memory=int(os.environ.get("OGPU_MODAL_MEMORY_MB") or 8192),
               timeout=int(float(os.environ.get("OGPU_TIMEOUT") or 3600)), volumes={"/cache": cache},
               scaledown_window=60, retries=0)
 def run(job):

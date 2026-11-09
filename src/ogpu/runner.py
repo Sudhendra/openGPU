@@ -82,9 +82,10 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
     track = track.resolve()
     roots = [track, *[e.resolve() for e in extra]]
     cache = cfg.cache if cache is None else cache
-    # fidelity is part of the key: a correctness run on a cheap GPU must not satisfy a timing request
-    key = ledger.content_key(roots, cmd, mode if fidelity == "timing" else f"{mode}:{fidelity}", cfg.image) \
-        if cache else None
+    # fidelity and the target hardware are part of the key: an L4 result must never answer an H100 request
+    target = (cfg.pool("correctness") if fidelity == "correctness" else None) or cfg
+    key = ledger.content_key(roots, cmd, mode if fidelity == "timing" else f"{mode}:{fidelity}", cfg.image,
+                             f"{target.provider}:{','.join(target.gpu_type_ids)}") if cache else None
     db = ledger.connect()
     now = time.time()
 
@@ -95,19 +96,13 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
         ledger.record(db, **{k: r.get(k) for k in ("id", "key", "agent", "track", "cmd", "mode", "backend", "status",
                                                    "exit_code", "started", "ended", "wall_s", "cost_usd", "metrics",
                                                    "log_path", "cached_from", "track_path", "note", "failure",
-                                                   "error", "submitted")})
+                                                   "error", "submitted", "pool")})
         return r
     if cache and (fly := ledger.in_flight(db, key)):
         console.print(f"[yellow]≡[/] identical job {fly['id']} already in flight ({fly['agent']}) — waiting on it")
         return {"id": fly["id"], "status": "queued", "deduped": True}
 
-    if mode == "gpu":
-        spent = ledger.spend(db, ledger.today_start())
-        if spent >= cfg.budget_usd:
-            raise BudgetExceeded(spent, cfg.budget_usd)
-        if spent >= 0.8 * cfg.budget_usd:
-            notify.once("budget80", "ogpu budget", f"${spent:.2f} of ${cfg.budget_usd:.0f} daily cap used")
-
+    check_budget(cfg, db)
     pool = choose_pool(cfg, console, mode, fidelity)
     jid = time.strftime("%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
     timeout_s = timeout_s or cfg.default_timeout_s or None
@@ -129,7 +124,8 @@ def submit(cfg: Config, console: Console, *, track: Path, extra: list[Path], cmd
                 continue
             raise SystemExit(f"could not start the job on the {pool} pod: {detail}") from None
     ledger.record(db, id=jid, key=key, agent=agent, track=track.name, cmd=cmd, mode=mode,
-                  backend=cfg.pool(pool).provider, status="queued", handle=json.dumps(handle) if handle else None, exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
+                  backend=cfg.pool(pool).provider, status="queued", handle=json.dumps(handle) if handle else None,
+                  exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={},
                   log_path=str(LOG_DIR / f"{jid}.log"), cached_from=None, track_path=str(track), note=note,
                   extra_paths=json.dumps([str(e.resolve()) for e in extra]),
                   failure=None, error=None, timeout_s=timeout_s, submitted=now, pool=pool)
@@ -152,13 +148,45 @@ def push_and_start(cfg: Config, console: Console, pool: str, jid: str, agent: st
         ssh.run(st, k, submit_argv(spec), timeout=120)
 
 
+def check_budget(cfg: Config, db) -> None:
+    """Every new job (GPU or CPU, any provider) is refused once today's spend reaches the cap. Spend includes
+    serverless jobs still running and ones nobody waited on (settled here first)."""
+    settle_serverless(cfg, db)
+    spent = ledger.spend(db, ledger.today_start())
+    if spent >= cfg.budget_usd:
+        raise BudgetExceeded(spent, cfg.budget_usd)
+    if spent >= 0.8 * cfg.budget_usd:
+        notify.once("budget80", "ogpu budget", f"${spent:.2f} of ${cfg.budget_usd:.0f} daily cap used")
+
+
+def settle_serverless(cfg: Config, db) -> None:
+    """Record serverless jobs that finished while nobody was waiting on them (submit without wait), so their cost
+    reaches the ledger and the budget. Jobs another process is already waiting on are left to it."""
+    rows = db.execute("select id, handle from runs where handle is not null and status in ('queued','running')")
+    for row in rows.fetchall():
+        try:
+            h = json.loads(row["handle"])
+        except ValueError:
+            continue
+        if not Path(h["results"]).exists() and pid_alive(h["pid"]):
+            continue
+        (HOME / "locks").mkdir(parents=True, exist_ok=True)
+        with open(HOME / "locks" / f"{row['id']}.lock", "w") as lk:
+            try:
+                fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue  # a `wait` is on it
+        finalize(cfg, Console(stderr=True, quiet=True), row["id"], stream=False)
+
+
 def start_serverless(pcfg: Config, jid: str, track: Path, extra: list[Path], cmd: str, mode: str, timeout_s) -> dict:
     gpu = modal_backend.gpu_for(pcfg, mode)
     results = LOG_DIR / f"{jid}.modal" / "results.json"
     launcher_log = LOG_DIR / f"{jid}.modal.log"
     p = modal_backend.launch(pcfg, track=track, extra=extra, cmds=[cmd], gpu=gpu, results=results, log=launcher_log,
                              timeout_s=timeout_s, detach=True)
-    return {"pid": p.pid, "results": str(results), "log": str(launcher_log), "gpu": gpu}
+    return {"pid": p.pid, "results": str(results), "log": str(launcher_log), "gpu": gpu,
+            "rate": modal_backend.rate(gpu, *modal_backend.container(pcfg))}
 
 
 def hang_policy(cfg: Config, db, track: str, cmd: str, pool: str) -> dict:
@@ -228,7 +256,7 @@ def finalize(cfg: Config, console: Console, jid: str, *, stream: bool) -> dict:
         if row["handle"]:  # serverless
             h = json.loads(row["handle"])
             status, rc, started, ended, last = wait_serverless(console, h, log_path, out_local, stream=stream)
-            rate = modal_backend.rate(h["gpu"])
+            rate = h.get("rate") or modal_backend.rate(h["gpu"])
             billed = last.get("billed_s")
         else:
             st = load_state(pool)
@@ -276,7 +304,7 @@ def wait_serverless(console: Console, h: dict, log_path: Path, out_local: Path, 
     try:
         while True:
             done = results.exists() or not pid_alive(h["pid"])
-            if stream and launcher_log.exists():
+            if stream and launcher_log.is_file():
                 with open(launcher_log, "rb") as f:
                     f.seek(offset)
                     chunk = f.read()
@@ -293,7 +321,7 @@ def wait_serverless(console: Console, h: dict, log_path: Path, out_local: Path, 
         raise SystemExit(130)
     finally:
         spinner.stop()
-    tail = launcher_log.read_text(errors="replace")[-4000:] if launcher_log.exists() else ""
+    tail = launcher_log.read_text(errors="replace")[-4000:] if launcher_log.is_file() else ""
     if not results.exists():  # `modal run` itself failed (image build, auth, quota): retrying won't help
         log_path.write_text(tail or "modal run exited without a result\n")
         return "failed", 1, None, time.time(), {"launch_failed": True}

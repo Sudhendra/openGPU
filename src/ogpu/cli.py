@@ -97,6 +97,7 @@ def status(as_json: bool = typer.Option(False, "--json")):
             pod.sync_state(p, pool=name, provider=pcfg.provider)
         pods[name] = p
     with ledger.connect() as db:
+        runner.settle_serverless(cfg, db)
         today = ledger.spend(db, ledger.today_start())
     if as_json:
         print(json.dumps({"pods": {n: (p.__dict__ if p else None) for n, p in pods.items()}, "serverless": serverless,
@@ -364,6 +365,7 @@ def cost(as_json: bool = typer.Option(False, "--json")):
     st = load_state()
     t0 = ledger.today_start()
     with ledger.connect() as db:
+        runner.settle_serverless(cfg, db)
         today, week, total = ledger.spend(db, t0), ledger.spend(db, time.time() - 7 * 86400), ledger.spend(db)
         u = ledger.utilization(db, t0)
         per_agent = ledger.agent_spend(db, t0)
@@ -391,7 +393,7 @@ def gpus(filter_: str = typer.Argument("", metavar="FILTER"),
     from . import providers
     cfg = load_config()
     name = provider or cfg.provider
-    rows = modal_backend.gpu_types() if name == "modal" else providers.load(name, cfg).gpu_types()
+    rows = modal_backend.gpu_types(cfg) if name == "modal" else providers.load(name, cfg).gpu_types()
     t = Table(box=None, header_style="bold magenta")
     for c in ("id", "memory", "$/hr"):
         t.add_column(c)
@@ -422,6 +424,12 @@ def fanout(cmds_file: Path,
                 runner.emit(console, f.result(), False)
         return
     gpu = gpu or (cfg.gpu_type_ids[0] if cfg.provider == "modal" and cfg.gpu_type_ids else modal_backend.DEFAULT_GPU)
+    try:
+        with ledger.connect() as db:
+            runner.check_budget(cfg, db)
+    except runner.BudgetExceeded as e:
+        console.print(f"[bold red]✘ budget[/] {e.msg}")
+        raise typer.Exit(2)
     stamp = time.strftime("%m%d_%H%M%S")
     results_path = track / "output" / "ogpu-modal" / stamp / "results.json"
     console.print(f"[cyan]fanout[/] {len(cmds)} jobs → modal {gpu} · track {track.name}")
@@ -441,7 +449,7 @@ def fanout(cmds_file: Path,
                    "cmd": r["cmd"], "mode": "gpu" if gpu != "none" else "cpu", "backend": "modal",
                    "status": "done" if r["rc"] == 0 else "failed", "exit_code": r["rc"], "started": ended - r["wall_s"],
                    "ended": ended, "wall_s": r["wall_s"],
-                   "cost_usd": r.get("billed_s", r["wall_s"]) / 3600 * modal_backend.rate(gpu),
+                   "cost_usd": r.get("billed_s", r["wall_s"]) / 3600 * modal_backend.rate(gpu, *modal_backend.container(cfg)),
                    "metrics": ledger.parse_metrics(log, cfg.profile), "log_path": r["log_path"], "cached_from": None}
             ledger.record(db, **row)
             runner.result_line(console, row)
