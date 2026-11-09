@@ -1,85 +1,120 @@
 # openGPU
 
-**A GPU savings engine for coding agents. Pay for work, not for idle.**
+**A GPU savings engine for coding agents.**
 
-`ogpu` is a command-line GPU broker and shared job runtime. Agents (Claude Code, Codex, OpenCode, …) iterating on experiments call `ogpu run -- <cmd>`; ogpu puts the job on the cheapest capable GPU across **RunPod and Modal** (or your own provider), lets many agents share one machine without corrupting each other's measurements, records every run in a queryable ledger, and stops the machine the moment it goes idle.
+`ogpu` is a CLI that coding agents (Claude Code, Codex, OpenCode) use to run experiments on cloud GPUs. It runs jobs on RunPod, Modal, a host you already have, or your own provider. Agents share a machine without disturbing each other's measurements, every run is recorded in a queryable ledger, idle machines stop themselves, and a daily budget cap limits spend.
 
-> **Status: alpha.** RunPod is the most battle-tested provider; Modal is new.
+> **Status: alpha.** RunPod is the most exercised provider. Modal is newer; see [Known limitations](#known-limitations).
 
----
+## Features
 
-## Where the savings come from
-| | |
-|---|---|
-| **Never pay for idle** | An on-machine reaper stops the machine after *N* idle minutes (a guard restarts the reaper if it dies; every `ogpu` call checks its heartbeat). Disks and compiled caches persist, so the next job resumes warm. Serverless Modal jobs bill per second and never idle at all. |
-| **Cheapest capable GPU** | Pick the provider per pool, list GPU types and tiers in your price order (`ogpu gpus` shows prices), and ogpu falls back down the list on capacity errors. A broken or too-old host is detected by a real GPU allocation and replaced before any agent gets it. |
-| **Multi-fidelity** | `--fidelity correctness` jobs go to a cheaper pool (e.g. Modal L4s) so the expensive target GPU only times candidates that are already correct. `ogpu sweep` runs a whole tournament this way. |
-| **Batch & share** | GPU jobs queue behind an exclusive lock so timings never overlap; CPU jobs (compile gates) run in parallel at low priority, sized to the container's real CPU quota. Every job runs from its own code snapshot. |
-| **Opt-in result cache** | With `cache = true` (or `--cache`), an identical run (same synced files + command + image + provider and GPU types) returns the earlier result for $0, and identical in-flight jobs from different agents are deduplicated. Only passes and failures the code itself causes are replayed; infrastructure failures (launch errors, timeouts, hangs, OOM, CUDA errors) are always re-run. |
-| **Cost visibility** | `ogpu cost` / `ogpu top`: spend, GPU-busy % of paid time, idle dollars, spend per agent. A daily budget cap refuses every new job beyond it (GPU or CPU, `run`, `submit`, `sweep`, `fanout`); Modal jobs count while still running, including ones nobody waited on. |
-| **Agent-native** | One-line JSON results, failure classification with error excerpts, async `submit`/`wait`, meaningful exit codes, a drop-in agent skill and guard hook. |
+- **No paying for idle.** An on-machine reaper stops the machine after a configurable idle period, and disks and compiled caches persist for the next job. Modal jobs bill per second and have nothing to stop.
+- **GPU fallback.** List GPU types and tiers in the order you prefer. ogpu moves down the list on capacity errors and replaces hosts that fail a real GPU allocation.
+- **Multi-fidelity runs.** Send `--fidelity correctness` jobs to a cheaper pool so the expensive GPU only times candidates that already work. `ogpu sweep` runs a whole tournament this way.
+- **Safe sharing.** GPU jobs queue behind an exclusive lock so timings never overlap. CPU jobs run in parallel at low priority, and each job runs from its own code snapshot.
+- **Budget cap.** Beyond the daily limit, new jobs are refused. Modal jobs count toward spend while still running.
+- **Opt-in result cache.** Identical runs return the earlier result for free. Infrastructure failures are never replayed.
+- **Built for agents.** One-line JSON results, classified failures with error excerpts, async `submit`/`wait`, meaningful exit codes, and a shared ledger of what has been tried.
 
-## Quickstart
-**Requirements:** Python ≥ 3.11, `rsync`, an SSH key, and an account with at least one provider.
+## Installation
+
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/). RunPod and SSH hosts also need `rsync` and an SSH key.
 
 ```bash
-git clone <repo-url> openGPU && cd openGPU
-uv tool install --editable .            # puts `ogpu` on your PATH  (add `--with modal` for Modal)
+git clone https://github.com/Sudhendra/openGPU.git
+cd openGPU
 
-export RUNPOD_API_KEY=...               # and/or Modal: `modal token new`
-ogpu config                             # creates ~/.ogpu/config.toml: provider, GPU, budget, idle minutes
-ogpu gpus H100                          # GPU ids + prices for the configured provider (--provider modal)
+# RunPod or SSH hosts only
+uv tool install .
 
-cd path/to/your/project
-ogpu run --gpu -- python3 train.py      # sync, run under the GPU lock, stream the log, record the result
-ogpu top                                # live dashboard (in another terminal)
+# With Modal support (installs the `modal` CLI too)
+uv tool install '.[modal]' --with-executables-from modal
 ```
 
-## Usage
+Then authenticate with your provider:
+
 ```bash
-# run
+export RUNPOD_API_KEY=...    # RunPod
+modal token new              # Modal
+```
+
+## Quickstart
+
+```bash
+ogpu config                               # creates ~/.ogpu/config.toml
+ogpu gpus H100                            # GPU ids and prices for your provider
+
+cd path/to/your/project
+ogpu run --gpu -- python3 train.py        # sync, run under the GPU lock, stream the log
+ogpu cost                                 # spend, GPU-busy time, spend per agent
+```
+
+`ogpu top` opens a live dashboard of machines, queues and spend.
+
+## Usage
+
+```bash
+# Run
 ogpu run --gpu -m "lr 3e-4" -- python3 train.py --steps 200      # exclusive GPU lock, queued
 ogpu run --cpu -- python3 compile_check.py                       # no lock, runs immediately
 ogpu run --gpu --fidelity correctness -- python3 test_kernel.py  # cheaper pool, if configured
-ogpu run --gpu --with ../shared --timeout 900 --cache -- ...     # sync extra dirs, cap runtime, reuse results
+ogpu run --gpu --with ../shared --timeout 900 --cache -- ...     # extra dirs, runtime cap, reuse results
 
-# async
-ogpu submit --gpu -m "hypothesis" -- python3 bench.py a.py b.py   # → {"id": "...", "status": "queued"}
-ogpu wait <id> [<id> ...]                                        # one JSON result per job
+# Queue now, collect later
+ogpu submit --gpu -m "hypothesis" -- python3 bench.py a.py b.py
+ogpu wait <id> [<id> ...]
 
-# tournaments: correctness on the cheap pool → quick timing → full timing for finalists
+# Tournament: correctness on the cheap pool, quick timing, then full timing for finalists
 ogpu sweep --bench "python3 bench.py {files}" --best best.py cand_*.py
 
-# results
-ogpu ledger [--track T] [--best | --failed] [--json]
-ogpu show <id>   ogpu logs <id> [-f]   ogpu cancel <id>
+# One command per line, in parallel
+ogpu fanout cmds.txt --provider modal --gpu L4
 
-# machines & money
-ogpu up [--pool P] [--retry MIN]   ogpu down [--terminate]   ogpu status
-ogpu cost   ogpu top   ogpu gpus [FILTER] [--provider P]
-ogpu fanout cmds.txt --provider modal --gpu L4                   # one container per line, in parallel
+# Results
+ogpu ledger [--track T] [--best | --failed] [--json]
+ogpu show <id>
+ogpu logs <id> [-f]
+ogpu cancel <id>
+
+# Machines and money
+ogpu up [--pool P] [--retry MIN]
+ogpu down [--terminate]
+ogpu status
+ogpu cost
+ogpu gpus [FILTER] [--provider P]
 ```
 
-### Results
+### Result format
+
 With `--json`, every run ends with one line:
+
 ```json
 {"id": "1030-164825-d47177", "status": "done", "failure": null, "error": null, "exit_code": 0,
  "wall_s": 212.4, "cost_usd": 0.31, "metrics": {"score": 1.083, "loss": 0.412}, "note": "lr 3e-4",
  "pool": "timing", "log_path": "~/.ogpu/logs/1030-164825-d47177.log", "cached_from": null}
 ```
-- **`metrics`:** print `OGPU_METRIC name=value` from your script. `score` (higher = better) ranks runs in `ogpu ledger --best`.
-- **`failure`:** `null`, or one of `compile_error`, `import_error`, `correctness_fail`, `oom`, `cuda_error`, `timeout`, `hang`, `runtime_error`, `launch_error` (Modal couldn't start the job: image, auth, quota), `lost`, `cancelled`. `error` carries the relevant excerpt.
-- **Exit codes:** the job's own code, `3` = ran but correctness checks failed, `2` = daily budget cap reached.
-- **Files** your command writes to `out/` are copied back to `<project>/output/ogpu/<id>/`.
+
+| Field | Meaning |
+|---|---|
+| `metrics` | Print `OGPU_METRIC name=value` from your script. `score` (higher is better) ranks `ogpu ledger --best`. |
+| `failure` | `null`, or one of `compile_error`, `import_error`, `correctness_fail`, `oom`, `cuda_error`, `timeout`, `hang`, `runtime_error`, `launch_error`, `lost`, `cancelled`. |
+| `error` | The relevant excerpt from the log. |
+| `cached_from` | The earlier run this result came from, if the cache was used. |
+
+**Exit codes:** the job's own code, `2` if the daily budget cap was reached, `3` if the job ran but correctness checks failed.
+
+**Output files:** anything your command writes to `out/` is copied back to `<project>/output/ogpu/<id>/`.
 
 ## Providers
-| Provider | Kind | Key | Notes |
-|---|---|---|---|
-| `runpod` | machine | `RUNPOD_API_KEY` | Tiers `COMMUNITY`, `SECURE`. Host CUDA filter from `min_cuda`. |
-| `modal` | serverless | `modal token new` | One container per job, per-second billing, nothing to stop. GPU ids: `H200`, `H100`, `A100-80GB`, `L40S`, `L4`, `T4`, … Each container gets `[providers.modal] cpu = 2` cores and `memory_gb = 8` (billed too: raise only if needed). |
-| `ssh` | machine | — | A host you already have: `[providers.ssh] host/port/user/cost_per_hr/stop_cmd`. |
 
-Set `provider` at the top level and override it per pool, e.g. timing on RunPod H100s, correctness on Modal L4s:
+| Provider | Type | Auth | Notes |
+|---|---|---|---|
+| `runpod` | Machine | `RUNPOD_API_KEY` | Tiers `COMMUNITY` and `SECURE`. Filters hosts by `min_cuda`. |
+| `modal` | Serverless | `modal token new` | One container per job. GPU ids include `H200`, `H100`, `A100-80GB`, `L40S`, `L4`, `T4`. |
+| `ssh` | Machine | SSH key | A host you already have. Set `host`, `port`, `user`, `cost_per_hr` and `stop_cmd` under `[providers.ssh]`. |
+
+Set `provider` at the top level and override it per pool. For example, timing on RunPod and correctness on Modal:
+
 ```toml
 provider = "runpod"
 gpu_type_ids = ["NVIDIA H100 80GB HBM3"]
@@ -89,74 +124,118 @@ provider = "modal"
 gpu_type_ids = ["L4"]
 ```
 
-**Your own provider:** subclass `ogpu.providers.Provider` (get/find/create/resume/stop/terminate; see [`providers/ssh.py`](src/ogpu/providers/ssh.py) for the smallest example) and point the config at it:
+Modal bills for CPU and memory as well as the GPU. Containers default to 2 cores and 8 GiB; raise them only if a job needs more:
+
+```toml
+[providers.modal]
+cpu = 2
+memory_gb = 8
+```
+
+### Adding a provider
+
+Subclass `ogpu.providers.Provider` and implement `get`, `find`, `create`, `resume`, `stop` and `terminate`. [`providers/ssh.py`](src/ogpu/providers/ssh.py) is the smallest example. Then point the config at it:
+
 ```toml
 provider = "mycloud"
+
 [providers.mycloud]
 module = "my_pkg.mycloud:MyCloud"   # or an `ogpu.providers` entry point named "mycloud"
 region = "us-east"                  # other keys are passed to the provider as `opts`
 ```
 
 ## Configuration
-`~/.ogpu/config.toml`. Secrets come from the environment, never this file.
 
-| Key | Default | |
+Settings live in `~/.ogpu/config.toml`. Secrets come from the environment, never this file. Unknown keys are rejected, so a typo can't silently fall back to a default.
+
+| Key | Default | Description |
 |---|---|---|
 | `provider` | `runpod` | `runpod`, `modal`, `ssh`, or your own |
-| `gpu_type_ids` | provider default (H100s) | Provider-native ids, tried in order (`ogpu gpus`) |
+| `gpu_type_ids` | provider default | Provider-native GPU ids, tried in order |
 | `cloud_types` | provider default | Provider tiers, tried in order |
 | `image` | `pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel` | Any image with `python3` |
-| `idle_minutes` | `10` | The machine stops itself after this much idle time |
-| `budget_usd` | `25` | Daily cap. New jobs are refused beyond it. |
+| `idle_minutes` | `10` | Idle time before a machine stops itself |
+| `budget_usd` | `25` | Daily spend cap |
 | `cache` | `false` | Reuse identical runs (`--cache/--no-cache` per run) |
-| `min_cuda` | `12.4` | Only hosts whose driver supports this CUDA |
-| `profile` | `""` | `"okc"`: Open Kernel Challenge preset (below) |
-| `volume_gb` / `container_disk_gb` | `50` / `50` | Persistent volume at `/workspace` / container disk |
-| `auto_up` / `quiet_timing` | `true` / `true` | Bring machines up on demand / keep CPU jobs off the timing cores |
+| `min_cuda` | `12.4` | Only use hosts whose driver supports this CUDA version |
+| `profile` | `""` | Named preset, e.g. `okc` |
+| `volume_gb` | `50` | Persistent volume at `/workspace` |
+| `container_disk_gb` | `50` | Container disk |
+| `auto_up` | `true` | Bring machines up on demand |
+| `quiet_timing` | `true` | Keep CPU jobs off the timing cores |
 | `[pools.correctness]` | none | Any of the keys above, for `--fidelity correctness` jobs |
 
-Unknown keys are rejected (a typo never falls back to a default). Environment: provider keys, `OGPU_AGENT` (label in the ledger), `OGPU_HOME` (default `~/.ogpu`), `OGPU_NO_NOTIFY`.
+**Environment variables:** `OGPU_AGENT` (label in the ledger), `OGPU_HOME` (default `~/.ogpu`), `OGPU_NO_NOTIFY`, `OGPU_MODAL_<GPU>_HR` (override a Modal GPU's hourly rate).
+
+### Result cache
+
+With `cache = true` or `--cache`, a run with the same synced files, command, image, provider and GPU types returns the earlier result, and identical in-flight jobs are joined rather than run twice. Passes and failures caused by the code itself are reused. Launch errors, timeouts, hangs, out-of-memory and CUDA errors always re-run.
 
 ### Profiles
-`profile = "okc"` presets ogpu for the Open Kernel Challenge: the judge image on an H200 timing pool, an H100 correctness pool, `min_cuda = 13.0`, and the OKC bench output (`SCORE`, `CHECK`, `CHECKS`, `SIDE` lines) parsed into metrics. Anything you set in the file still wins.
 
-## Using it with coding agents
+`profile = "okc"` presets ogpu for the Open Kernel Challenge: the judge image on an H200 timing pool, an H100 correctness pool, `min_cuda = 13.0`, and parsing of the OKC bench output into metrics. Anything you set in the config still takes precedence.
+
+## Using with coding agents
+
 ```bash
-./scripts/install-skill.sh      # installs the `ogpu` skill for Claude Code, Codex and OpenCode
+./scripts/install-skill.sh    # installs the `ogpu` skill for Claude Code, Codex and OpenCode
 ```
+
 - **Skill:** [`skills/ogpu/SKILL.md`](skills/ogpu/SKILL.md) teaches agents the commands, the result format and an experiment loop.
-- **Project rule:** paste [`agents/OGPU.md`](agents/OGPU.md) into your project's `AGENTS.md` / `CLAUDE.md`.
-- **Guard hook (Claude Code):** [`scripts/hooks/guard_gpu.py`](scripts/hooks/guard_gpu.py) as a `PreToolUse` hook blocks raw `ssh`/`scp` to machines, `runpodctl` and `modal run`, and points the agent to `ogpu`.
+- **Project rule:** paste [`agents/OGPU.md`](agents/OGPU.md) into your project's `AGENTS.md` or `CLAUDE.md`.
+- **Guard hook (Claude Code):** use [`scripts/hooks/guard_gpu.py`](scripts/hooks/guard_gpu.py) as a `PreToolUse` hook to block raw `ssh`/`scp` to machines, `runpodctl` and `modal run`.
 
 ## How it works
-```
- laptop                                          GPU machine (your image)
- ┌───────────────────────┐   rsync + ssh   ┌──────────────────────────────────────────────┐
- │ ogpu CLI              │ ──────────────▶ │ /workspace/src/<project>       latest push    │
- │  · ledger.db (SQLite) │  (multiplexed,  │ /workspace/.ogpu/runs/<job>/   job snapshot   │
- │  · opt-in cache       │   pinned keys)  │ jobrun.py   queue + GPU flock + timeouts      │
- │  · ogpu top           │ ◀── poll/logs ──│ reaper.py   idle → stop via the provider     │
- └───────────────────────┘                 └──────────────────────────────────────────────┘
-```
-1. `ogpu run` checks the budget (and the cache, if enabled) and ensures the pool's machine is up.
-2. It pushes your project and submits the job. The runner snapshots the code, takes the GPU lock and runs the job detached, so SSH drops and Ctrl-C don't kill it. A watchdog kills hung jobs.
-3. The CLI polls the log, pulls back `out/`, parses metrics, classifies failures and writes the ledger.
-4. The reaper stops the machine when idle. Serverless pools (Modal) skip all of this: one container per job.
 
-Only Python's standard library runs on the machine, so any image with `python3` works.
+```
+ your machine                                  GPU machine
+ ┌──────────────────────┐   rsync + ssh   ┌─────────────────────────────────────────────┐
+ │ ogpu CLI             │ ──────────────▶ │ /workspace/src/<project>      latest sync   │
+ │ ledger.db (SQLite)   │                 │ /workspace/.ogpu/runs/<job>/  job snapshot  │
+ │ ogpu top             │ ◀── poll/logs ──│ jobrun.py   GPU lock, timeouts, watchdog    │
+ │                      │                 │ reaper.py   idle → stop via provider        │
+ └──────────────────────┘                 └─────────────────────────────────────────────┘
+```
+
+1. `ogpu run` checks the budget and, if enabled, the cache, then makes sure the pool's machine is up.
+2. It syncs your project and submits the job. The runner snapshots the code, takes the GPU lock and runs detached, so SSH drops and Ctrl-C don't kill it.
+3. The CLI polls the log, pulls back `out/`, parses metrics, classifies failures and writes the ledger.
+4. The reaper stops the machine once it has been idle long enough.
+
+On Modal there is no machine to manage: each job gets its own container, and results come back when it finishes.
+
+## Known limitations
+
+- A Modal job is tied to the local `modal run` process, so it stops if your laptop sleeps or that process is killed.
+- `ogpu logs -f` can't follow a running Modal job, and `ogpu wait` has no deadline for Modal jobs.
+- Modal timeouts are reported as `runtime_error` rather than `timeout`.
+- Modal cost estimates don't include container start-up time, so they run slightly low.
+- Projects with the same directory name collide on a shared machine.
 
 ## Security
-- API keys stay on your machine and are sent in `Authorization` headers, never URLs. The on-machine reaper stops its machine with the provider's machine-scoped credentials.
-- Machines accept SSH with your public key only (no passwords). Host keys are pinned per machine on first use (`~/.ogpu/known_hosts/`), persisted on the machine's volume so they survive stop/resume, and only re-learned when ogpu itself (re)starts the machine.
-- `~/.ogpu` and the SSH control-socket directory are private (0700); a pre-existing socket dir owned by someone else is refused.
-- The guard hook and skill are guardrails for cooperative agents, not a sandbox. Custom providers are Python code you choose to load.
+
+- API keys are sent in `Authorization` headers, never URLs.
+- Machines accept SSH with your public key only. Host keys are pinned per machine in `~/.ogpu/known_hosts/`. If a provider restarts a machine outside ogpu and its key changes, delete that machine's file there to reconnect.
+- `~/.ogpu` and the SSH control-socket directory are private (`0700`).
+- Jobs on a shared machine run as root. The lock, guard hook and skill are for cooperating agents; they are not a sandbox, so don't share a machine with code you don't trust.
+- Custom providers are Python code that runs on your machine. Only load ones you trust.
 
 ## Development
+
 ```bash
 uv sync
-uv run pytest -q          # unit tests, including the on-machine runner exercised locally
+uv run pytest -q
 ```
-Layout: `src/ogpu/` (CLI, runner, ledger, TUI), `src/ogpu/providers/` (RunPod, Modal, SSH + the plugin interface), `src/ogpu/remote/` (code that runs on the machine), `src/ogpu/okc.py` (the OKC profile), `skills/`, `scripts/`, `tests/`. Plans: [`documents/`](documents/).
+
+| Path | Contents |
+|---|---|
+| `src/ogpu/` | CLI, job runner, ledger, dashboard |
+| `src/ogpu/providers/` | RunPod, Modal, SSH and the plugin interface |
+| `src/ogpu/remote/` | Code that runs on the GPU machine (standard library only) |
+| `src/ogpu/okc.py` | The Open Kernel Challenge profile |
+| `skills/`, `agents/`, `scripts/` | Agent integrations |
+| `tests/` | Test suite, including the on-machine runner exercised locally |
 
 ## License
-To be decided before the first public release.
+
+No license has been chosen yet.

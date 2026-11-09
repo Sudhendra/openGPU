@@ -1,7 +1,7 @@
 [project]
 name = "ogpu"
 version = "0.1.0"
-description = "GPU savings engine for coding agents: cheapest capable GPU across RunPod and Modal, shared safely, never paid for idle"
+description = "GPU savings engine for coding agents: shared GPUs on RunPod, Modal or your own provider, with idle stop and a daily budget cap"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
