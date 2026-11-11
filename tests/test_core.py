@@ -1,6 +1,5 @@
 import base64
 import json
-import os
 import subprocess
 import sys
 import time
@@ -10,7 +9,7 @@ import pytest
 
 from ogpu import agents, ledger, telemetry
 from ogpu.config import State
-from ogpu.providers.runpod import Enum, Pod, gql_literal
+from ogpu.providers.runpod import Enum, gql_literal, machine
 from ogpu.runner import submit_argv
 from ogpu.ssh import rsync_argv, ssh_argv
 
@@ -28,14 +27,16 @@ PAIR_LOG = 'SIDE s1: {"score_vs_sglang": 1.21, "ratio_vs_s0": 1.034, "ci95": [1.
 
 
 def test_parse_bench_metrics():
-    m = ledger.parse_metrics(BENCH_LOG)
+    assert ledger.parse_metrics(BENCH_LOG) == {}  # bench formats are a profile's, not the default
+    m = ledger.parse_metrics(BENCH_LOG, "okc")
     assert m["score"] == {"submission_best.py": 1.0831, "submission_sk.py": 1.1012}
     assert m["checks"] == "FAIL" and m["check_pass"] == 1 and m["check_fail"] == 1
     assert "submission_sk.py 1.1012×" in ledger.headline(m)
 
 
 def test_parse_pair_bench_and_custom_metrics():
-    m = ledger.parse_metrics(PAIR_LOG)
+    assert ledger.parse_metrics(PAIR_LOG) == {"tflops": 512.5}  # OGPU_METRIC works without a profile
+    m = ledger.parse_metrics(PAIR_LOG, "okc")
     assert m["sides"]["s1"]["ratio_vs_s0"] == 1.034
     assert m["tflops"] == 512.5
     assert "s1 1.0340× vs s0 [1.021,1.047]" in ledger.headline(m)
@@ -46,8 +47,14 @@ def test_content_key_tracks_sources_not_outputs(tmp_path):
     (tmp_path / "output").mkdir()
     k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     (tmp_path / "output" / "noise.log").write_text("ignored")
-    (tmp_path / "notes.md").write_text("ignored, not a source ext")
+    (tmp_path / "run.log").write_text("ignored")
+    (tmp_path / "a.pyc").write_bytes(b"ignored")
     assert ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img") == k1
+    (tmp_path / "data.csv").write_text("1,2\n")  # any synced file is an input, not just source extensions
+    k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
+    (tmp_path / "data.csv").write_text("1,3\n")
+    assert ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img") != k1
+    k1 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     (tmp_path / "submission.py").write_text("x = 2\n")
     k2 = ledger.content_key([tmp_path], "python3 bench.py", "gpu", "img")
     assert k2 != k1
@@ -89,7 +96,7 @@ def test_gql_literal_and_pod_parse():
     lit = gql_literal({"name": 'a"b', "cloudType": Enum("SECURE"), "gpuCount": 1, "x": None, "public": True,
                        "env": [{"key": "K", "value": "v"}]})
     assert lit == '{name: "a\\"b", cloudType: SECURE, gpuCount: 1, public: true, env: [{key: "K", value: "v"}]}'
-    pod = Pod.from_api({"id": "p", "desiredStatus": "RUNNING", "costPerHr": "4.31",
+    pod = machine({"id": "p", "desiredStatus": "RUNNING", "costPerHr": "4.31",
                         "runtime": {"uptimeInSeconds": 5, "ports": [
                             {"ip": "10.0.0.1", "isIpPublic": False, "privatePort": 22, "publicPort": 22, "type": "tcp"},
                             {"ip": "203.0.113.9", "isIpPublic": True, "privatePort": 22, "publicPort": 40123, "type": "tcp"}]}})
@@ -101,6 +108,8 @@ def test_ssh_and_rsync_commands():
     a = ssh_argv(st, "/k", "true")
     assert a[0] == "ssh" and "40123" in a and a[-2:] == ["root@203.0.113.9", "true"]
     assert any(o.startswith("ControlPath=") for o in a)
+    assert "StrictHostKeyChecking=accept-new" in a and "StrictHostKeyChecking=no" not in a  # host keys are pinned
+    assert any(o.startswith("UserKnownHostsFile=") and o.endswith("/known_hosts/p") for o in a)
     r = rsync_argv(st, "/k", "src/", "root@h:/dst/", delete=True)
     assert "--delete" in r and "--exclude" in r and r[-2:] == ["src/", "root@h:/dst/"]
     spec = {"id": "j", "cmd": "echo 'hi' && ls"}
@@ -113,8 +122,7 @@ def fake_pod(tmp_path, monkeypatch):
     """Run the real on-pod jobrun.py locally against a temp /workspace."""
     src = (Path(__file__).parent.parent / "src/ogpu/remote/jobrun.py").read_text()
     og = tmp_path / "og"
-    src = (src.replace('"/workspace/.ogpu"', repr(str(og))).replace('"/tmp/h200.lock"', repr(str(tmp_path / "h200.lock")))
-              .replace('"/workspace/okc/.runs"', repr(str(tmp_path / "runs"))))
+    src = (src.replace('"/workspace/.ogpu"', repr(str(og))).replace('"/tmp/ogpu-gpu.lock"', repr(str(tmp_path / "h200.lock"))))
     script = tmp_path / "jobrun.py"
     script.write_text(src)
     (og / "jobs").mkdir(parents=True)

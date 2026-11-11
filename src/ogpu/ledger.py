@@ -1,4 +1,4 @@
-"""SQLite ledger of every run + content-hash cache + metric parsing for the OKC bench scripts."""
+"""SQLite ledger of every run + the opt-in content-hash cache + metric parsing."""
 from __future__ import annotations
 
 import fnmatch
@@ -11,9 +11,13 @@ from pathlib import Path
 
 from .config import LEDGER_PATH
 
-SOURCE_EXTS = {".py", ".cu", ".cuh", ".h", ".hpp", ".cpp", ".cc", ".c", ".json", ".txt", ".toml", ".yaml", ".yml",
-               ".sh", ".ptx"}
+# the same things the sync leaves behind (ssh.EXCLUDES): everything else that is synced is an input to the run
 SKIP_DIRS = {".git", "output", "out", "profiles", "runs", "__pycache__", ".venv", "node_modules", ".pytest_cache"}
+SKIP_FILES = ("*.pyc", "*.log", ".DS_Store")
+HASH_MAX_BYTES = 64 << 20   # bigger files (datasets, checkpoints) are keyed by size + mtime instead of content
+# failures that the same inputs reproduce; anything else (launch_error, timeout, hang, oom, cuda_error, lost) may be
+# the machine's fault and must be re-run, never replayed from the cache
+CACHEABLE_FAILURES = ("compile_error", "import_error", "correctness_fail", "runtime_error")
 
 SCHEMA = """
 create table if not exists runs (
@@ -30,11 +34,12 @@ create table if not exists sessions (
 
 # columns added after v0; connect() adds them to existing ledgers
 EXTRA_COLUMNS = {"track_path": "text", "note": "text", "failure": "text", "error": "text", "timeout_s": "real",
-                 "submitted": "real", "extra_paths": "text"}
+                 "submitted": "real", "extra_paths": "text", "pool": "text",
+                 "handle": "text"}  # serverless jobs: how to find the launcher again (pid, results path)
 
 
 def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=30)
     db.row_factory = sqlite3.Row
     db.executescript(SCHEMA)
@@ -46,70 +51,60 @@ def connect(path: Path = LEDGER_PATH) -> sqlite3.Connection:
     return db
 
 
-def source_files(root: Path, excludes: list[str] = ()) -> list[Path]:
+def input_files(root: Path) -> list[Path]:
     out = []
     for p in sorted(root.rglob("*")):
         rel = p.relative_to(root)
-        if any(part in SKIP_DIRS for part in rel.parts) or not p.is_file() or p.suffix not in SOURCE_EXTS:
+        if any(part in SKIP_DIRS for part in rel.parts) or not p.is_file():
             continue
-        if any(fnmatch.fnmatch(str(rel), x) for x in excludes):
+        if any(fnmatch.fnmatch(p.name, x) for x in SKIP_FILES):
             continue
         out.append(p)
     return out
 
 
-def content_key(roots: list[Path], cmd: str, mode: str, image: str) -> str:
-    """Hash of every source file under the synced dirs + command + mode + image: identical inputs → identical key."""
+def content_key(roots: list[Path], cmd: str, mode: str, image: str, target: str = "") -> str:
+    """Hash of every synced file + command + mode + image + where it runs (provider and GPU types): identical inputs
+    on the same kind of hardware → identical key."""
     h = hashlib.sha256()
-    for k in (cmd, mode, image):
+    for k in (cmd, mode, image, target):
         h.update(k.encode() + b"\0")
     for root in roots:
-        for p in source_files(root):
+        for p in input_files(root):
             h.update(str(p.relative_to(root)).encode() + b"\0")
-            h.update(hashlib.sha256(p.read_bytes()).digest())
+            st = p.stat()
+            if st.st_size > HASH_MAX_BYTES:
+                h.update(f"{st.st_size}:{st.st_mtime_ns}".encode())
+            else:
+                h.update(hashlib.sha256(p.read_bytes()).digest())
     return h.hexdigest()
 
 
-SCORE = re.compile(r"^SCORE (\S+): ([\d.]+)")
-CHECK = re.compile(r"^CHECK (\S+) (\S+) (\S+): (PASS|FAIL)")
-CHECKS = re.compile(r"^CHECKS: (ALL PASS|(\d+) FAIL)")
-SIDE = re.compile(r"^SIDE (\S+): (\{.*\})\s*$")
 METRIC = re.compile(r"^OGPU_METRIC (\w+)=(\S+)")
 
 
-def parse_metrics(log: str) -> dict:
-    """Pull the headline numbers out of pod/bench.py, pair_bench.py, and any `OGPU_METRIC k=v` lines."""
+def parse_metrics(log: str, profile: str = "") -> dict:
+    """`OGPU_METRIC name=value` lines from any script (print `OGPU_METRIC score=<x>` to rank runs by it), plus the
+    profile's own bench format (profile = "okc")."""
     m: dict = {}
-    fails = passes = 0
+    if profile == "okc":
+        from . import okc
+        m = okc.parse(log)
     for line in log.splitlines():
-        line = line.strip()
-        if r := SCORE.match(line):
-            m.setdefault("score", {})[r[1]] = float(r[2])
-        elif r := CHECK.match(line):
-            passes += r[4] == "PASS"
-            fails += r[4] == "FAIL"
-        elif r := CHECKS.match(line):
-            m["checks"] = "PASS" if r[1] == "ALL PASS" else "FAIL"
-        elif r := SIDE.match(line):
-            try:
-                m.setdefault("sides", {})[r[1]] = json.loads(r[2])
-            except ValueError:
-                pass
-        elif r := METRIC.match(line):
+        if r := METRIC.match(line.strip()):
             try:
                 m[r[1]] = float(r[2])
             except ValueError:
                 m[r[1]] = r[2]
-    if passes or fails:
-        m["check_pass"], m["check_fail"] = passes, fails
-        m.setdefault("checks", "FAIL" if fails else "PASS")
     return m
 
 
 def headline(metrics: dict) -> str:
     """One short human string, e.g. 'best 1.0831× · checks PASS'."""
     parts = []
-    if metrics.get("score"):
+    if isinstance(metrics.get("score"), (int, float)):
+        parts.append(f"score {metrics['score']:.4g}")
+    elif metrics.get("score"):
         name, v = max(metrics["score"].items(), key=lambda kv: kv[1])
         parts.append(f"{name} {v:.4f}×")
     for k, s in (metrics.get("sides") or {}).items():
@@ -127,9 +122,10 @@ IN_FLIGHT_S = 3 * 3600
 
 
 def cached(db: sqlite3.Connection, key: str):
-    """A finished run of the same inputs (lost/cancelled runs don't count: they measured nothing)."""
-    return db.execute("select * from runs where key=? and status in ('done','failed') and cached_from is null "
-                      "order by ended desc limit 1", (key,)).fetchone()
+    """A finished run of the same inputs: a pass, or a failure the inputs themselves cause (see CACHEABLE_FAILURES)."""
+    marks = ",".join("?" * len(CACHEABLE_FAILURES))
+    return db.execute(f"select * from runs where key=? and cached_from is null and (status='done' or (status='failed' "
+                      f"and failure in ({marks}))) order by ended desc limit 1", (key, *CACHEABLE_FAILURES)).fetchone()
 
 
 def in_flight(db: sqlite3.Connection, key: str):
@@ -149,8 +145,19 @@ def update(db: sqlite3.Connection, run_id: str, **fields) -> None:
     db.commit()
 
 
+def usual_runtime(db: sqlite3.Connection, track: str, cmd: str, pool: str, last: int = 20) -> tuple[float, int]:
+    """(p90 wall seconds, n) over recent finished runs of this exact command on this pool."""
+    walls = sorted(r["wall_s"] for r in db.execute(
+        "select wall_s from runs where track=? and cmd=? and coalesce(pool,'timing')=? and status in ('done','failed') "
+        "and cached_from is null and wall_s > 0 order by ended desc limit ?", (track, cmd, pool, last)))
+    if not walls:
+        return 0.0, 0
+    return walls[min(len(walls) - 1, int(0.9 * len(walls)))], len(walls)
+
+
 def best_score(metrics: dict) -> float | None:
-    vals = list((metrics.get("score") or {}).values())
+    score = metrics.get("score")
+    vals = [score] if isinstance(score, (int, float)) else list((score or {}).values())
     vals += [s["ratio_vs_s0"] for s in (metrics.get("sides") or {}).values() if s.get("ratio_vs_s0")]
     return max(vals) if vals else None
 
@@ -176,10 +183,11 @@ def record(db: sqlite3.Connection, **row) -> None:
     db.commit()
 
 
-def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_per_hr: float) -> None:
+def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_per_hr: float,
+                   start: float | None = None) -> None:
     """Upsert the current pod session. start ≈ now − uptime jitters by a few seconds between polls, so match any
     session of this pod that started within 2 minutes instead of keying on an exact start."""
-    start = time.time() - uptime_s
+    start = time.time() - uptime_s if start is None else start
     row = db.execute("select start from sessions where pod_id=? and abs(start - ?) < 120 order by abs(start - ?) "
                      "limit 1", (pod_id, start, start)).fetchone()
     if row:
@@ -191,8 +199,18 @@ def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_pe
 
 
 def spend(db: sqlite3.Connection, since: float = 0.0) -> float:
-    """$ spent in sessions that ended after `since` (clipped to `since`)."""
-    total = 0.0
+    """$ spent in machine sessions that ended after `since` (clipped to `since`), plus serverless jobs (billed per
+    job, no machine session)."""
+    total = db.execute("select coalesce(sum(cost_usd), 0) c from runs where backend = 'modal' and ended > ?",
+                       (since,)).fetchone()["c"]
+    now = time.time()
+    # serverless jobs still in flight bill as they go: count them from submission (conservative: includes start-up)
+    for r in db.execute("select submitted, handle from runs where backend = 'modal' and status in ('queued','running')"):
+        try:
+            rate = json.loads(r["handle"])["rate"]
+        except (TypeError, ValueError, KeyError):
+            continue
+        total += max(0.0, now - max(r["submitted"] or now, since)) / 3600 * rate
     for s in db.execute("select * from sessions"):
         start, end = s["start"], s["start"] + s["uptime_s"]
         if end > since:
@@ -224,7 +242,7 @@ def utilization(db: sqlite3.Connection, since: float = 0.0) -> dict:
             sessions.append((a, b, s["cost_per_hr"]))
             paid_cost += (b - a) / 3600 * s["cost_per_hr"]
     spans = _union([(a, b) for a, b, _ in sessions])
-    rows = db.execute("select mode, started, ended from runs where backend='runpod' and started is not null "
+    rows = db.execute("select mode, started, ended from runs where backend not in ('cache','modal') and started is not null "
                       "and ended is not null and ended > ?", (since,)).fetchall()
     gpu = _union([(r["started"], r["ended"]) for r in rows if r["mode"] == "gpu"])
     busy = _union([(r["started"], r["ended"]) for r in rows])

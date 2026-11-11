@@ -1,32 +1,37 @@
-"""One generic Modal app for parallel exploration (replaces the per-track okc_modal.py copies).
+"""The Modal app behind `provider = "modal"` and `ogpu fanout`: one container per command, billed per second.
 
-Launched by `ogpu fanout --backend modal`; the env picks the track and GPU at import time:
-  OGPU_TRACK=/abs/path/to/track  OGPU_MODAL_GPU=H200|H100|none  OGPU_RESULTS=/abs/path/results.json
-  modal run src/ogpu/providers/modal_app.py --cmds cmds.txt
+Launched by ogpu as `modal run modal_app.py --cmds cmds.txt`; the env picks the dirs, GPU and image at import time:
+  OGPU_TRACK=/abs/track  OGPU_WITH=/abs/a:/abs/b  OGPU_MODAL_GPU=H100|none  OGPU_IMAGE=...  OGPU_TIMEOUT=3600
+  OGPU_RESULTS=/abs/results.json
 
-Each command gets its own container in the judge image with the track at /root/okc/<track>; compiled torch
-extensions are shared through one Volume; files written under out/ come back with the log.
+Each command runs in a fresh copy of the dirs under /root/src/; compiled torch extensions are shared through one
+Volume; files written under out/ come back next to the log.
 """
 import os
+import shlex
 import time
 from pathlib import Path
 
 import modal
 
 TRACK = Path(os.environ.get("OGPU_TRACK", ".")).resolve()
-ROOT = f"/root/okc/{TRACK.name}"
-GPU = os.environ.get("OGPU_MODAL_GPU", "H200")
-IGNORE = ["output", "out", "profiles", "runs", ".git", "**/__pycache__", "**/.DS_Store", "*.log", ".venv"]
+EXTRA = [Path(p).resolve() for p in os.environ.get("OGPU_WITH", "").split(os.pathsep) if p]
+GPU = os.environ.get("OGPU_MODAL_GPU", "H100")
+IGNORE = ["output", "out", "profiles", "runs", ".git", "**/__pycache__", "**/.DS_Store", "*.log", ".venv",
+          "node_modules"]
 
-app = modal.App("ogpu-fanout")
-image = (modal.Image.from_registry(os.environ.get("OGPU_IMAGE", "lmsysorg/sglang:dev-muse-spark-open"))
-         .env({"PYTHONUNBUFFERED": "1", "TORCH_EXTENSIONS_DIR": "/tmp/torch_ext"})
-         .add_local_dir(TRACK, "/src", ignore=IGNORE))
+app = modal.App("ogpu")
+image = (modal.Image.from_registry(os.environ.get("OGPU_IMAGE", "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel"))
+         .env({"PYTHONUNBUFFERED": "1", "TORCH_EXTENSIONS_DIR": "/tmp/torch_ext", "OGPU_ROOT": f"/root/src/{TRACK.name}"}))
+for d in [TRACK, *EXTRA]:
+    image = image.add_local_dir(d, f"/src/{d.name}", ignore=IGNORE)
 cache = modal.Volume.from_name("ogpu-ext-cache", create_if_missing=True)
 
 
-@app.function(image=image, gpu=None if GPU == "none" else GPU, cpu=8, memory=32768, timeout=3600,
-              volumes={"/cache": cache}, scaledown_window=120, retries=0)
+@app.function(image=image, gpu=None if GPU == "none" else GPU, cpu=float(os.environ.get("OGPU_MODAL_CPU") or 2),
+              memory=int(os.environ.get("OGPU_MODAL_MEMORY_MB") or 8192),
+              timeout=int(float(os.environ.get("OGPU_TIMEOUT") or 3600)), volumes={"/cache": cache},
+              scaledown_window=60, retries=0)
 def run(job):
     import base64
     import io
@@ -35,8 +40,10 @@ def run(job):
     import tarfile
     import time
 
+    t_container = time.time()  # Modal bills the container (setup + job + teardown), not just the command
     i, cmd = job
-    subprocess.run(f"rm -rf {ROOT} && mkdir -p {ROOT} && cp -r /src/. {ROOT}/ && mkdir -p {ROOT}/out "
+    root = os.environ["OGPU_ROOT"]
+    subprocess.run(f"rm -rf /root/src && mkdir -p /root/src && cp -r /src/. /root/src/ && mkdir -p {shlex.quote(root)}/out "
                    "&& mkdir -p /cache/torch_ext /tmp/torch_ext && cp -r /cache/torch_ext/. /tmp/torch_ext/",
                    shell=True, check=True)
     have = set(os.listdir("/tmp/torch_ext"))
@@ -44,7 +51,7 @@ def run(job):
                           text=True).stdout.strip() or "cpu"
     lines = [f"[{i}] gpu: {head}", f"[{i}] $ {cmd}"]
     t0 = time.time()
-    p = subprocess.Popen(["bash", "-lc", cmd], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    p = subprocess.Popen(["bash", "-lc", cmd], cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     for ln in p.stdout:
         lines.append(ln.rstrip("\n"))
         print(f"[{i}] {ln}", end="", flush=True)
@@ -54,27 +61,43 @@ def run(job):
     new = [d for d in os.listdir("/tmp/torch_ext") if d not in have]
     for d in new:
         if not os.path.exists(f"/cache/torch_ext/{d}"):
-            subprocess.run(f"cp -r /tmp/torch_ext/{d} /cache/torch_ext/.{d}.{os.getpid()} && "
-                           f"mv -T /cache/torch_ext/.{d}.{os.getpid()} /cache/torch_ext/{d}", shell=True)
+            tmp = shlex.quote(f"/cache/torch_ext/.{d}.{os.getpid()}")
+            subprocess.run(f"cp -r {shlex.quote(f'/tmp/torch_ext/{d}')} {tmp} && "
+                           f"mv -T {tmp} {shlex.quote(f'/cache/torch_ext/{d}')}", shell=True)
     if new:
         cache.commit()
     b = io.BytesIO()
     with tarfile.open(fileobj=b, mode="w:gz") as t:
-        t.add(f"{ROOT}/out", arcname="out")
-    return {"i": i, "cmd": cmd, "rc": rc, "wall_s": wall, "gpu": head, "log": "\n".join(lines),
+        t.add(f"{root}/out", arcname="out")
+    return {"i": i, "cmd": cmd, "rc": rc, "wall_s": wall, "billed_s": time.time() - t_container, "gpu": head,
+            "log": "\n".join(lines),
             "out": base64.b64encode(b.getvalue()).decode()}
 
 
-@app.local_entrypoint()
-def main(cmds: str = "", cmd: str = ""):
-    import base64
+def extract_out(tar_bytes: bytes, dest: Path) -> None:
+    """Unpack a job's out/ into dest; members that would land outside it (../, absolute paths) are skipped."""
     import io
-    import json
     import tarfile
+    dest = dest.resolve()
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as t:
+        for m in t.getmembers():
+            if not m.isfile():
+                continue
+            p = (dest / Path(m.name).relative_to("out")).resolve()
+            if not p.is_relative_to(dest):
+                continue
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(t.extractfile(m).read())
 
-    jobs = [cmd] if cmd else [ln.strip() for ln in open(cmds) if ln.strip() and not ln.lstrip().startswith("#")]
-    results_path = Path(os.environ.get("OGPU_RESULTS", TRACK / "output" / "ogpu-modal" / time.strftime("%m%d_%H%M%S")
-                                       / "results.json"))
+
+@app.local_entrypoint()
+def main(cmds: str = ""):
+    import base64
+    import json
+
+    jobs = [ln.strip() for ln in open(cmds) if ln.strip() and not ln.lstrip().startswith("#")]
+    results_path = Path(os.environ.get("OGPU_RESULTS") or TRACK / "output" / "ogpu-modal" /
+                        time.strftime("%m%d_%H%M%S") / "results.json")
     dest = results_path.parent
     dest.mkdir(parents=True, exist_ok=True)
     results = []
@@ -83,13 +106,9 @@ def main(cmds: str = "", cmd: str = ""):
             results.append({"error": repr(r)})
             continue
         log_path = dest / f"{r['i']}.log"
-        log_path.write_text(r["log"] + "\n")
-        with tarfile.open(fileobj=io.BytesIO(base64.b64decode(r.pop("out"))), mode="r:gz") as t:
-            for m in t.getmembers():
-                if m.isfile():
-                    p = dest / str(r["i"]) / Path(m.name).relative_to("out")
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    p.write_bytes(t.extractfile(m).read())
-        r.pop("log")
-        results.append(r | {"log_path": str(log_path)})
-    results_path.write_text(json.dumps(results, indent=1))
+        log_path.write_text(r.pop("log") + "\n")
+        extract_out(base64.b64decode(r.pop("out")), dest / str(r["i"]))
+        results.append(r | {"log_path": str(log_path), "ended": time.time()})
+    tmp = results_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(results, indent=1))
+    tmp.replace(results_path)

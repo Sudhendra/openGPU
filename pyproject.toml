@@ -1,8 +1,10 @@
 [project]
 name = "ogpu"
 version = "0.1.0"
-description = "Personal H200 broker + shared bench service for GPU kernel hill-climbing with coding agents"
+description = "GPU savings engine for coding agents: shared GPUs on RunPod, Modal or your own provider, with idle stop and a daily budget cap"
 readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "typer>=0.12",
