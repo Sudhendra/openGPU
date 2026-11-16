@@ -279,7 +279,8 @@ def cancel(job_id: str):
             pass
         if row["status"] not in ledger.TERMINAL:
             with ledger.connect() as db:
-                ledger.update(db, job_id, status="cancelled", exit_code=-15, ended=time.time())
+                ledger.update(db, job_id, status="cancelled", exit_code=-15, ended=time.time(),
+                              cost_usd=runner.cancelled_serverless_cost(row))
     else:
         ssh.run(load_state(_job_pool(job_id)), cfg.private_key_path, f"{runner.JOBRUN} cancel {shlex.quote(job_id)}")
     console.print(f"[yellow]■[/] cancelled {job_id}")

@@ -222,7 +222,10 @@ class Sweep:
         if self.best:
             self.best.full = scores.get(self.best.token)
         for c in cands:
-            c.stage, c.full = "full", scores.get(c.token)
+            c.stage = "full"
+            if c.dropped:  # failed the correctness recheck in this very job: its timing must not rank it
+                continue
+            c.full = scores.get(c.token)
             if c.full and self.best and self.best.full:
                 c.vs_best = c.full / self.best.full
 
@@ -231,9 +234,11 @@ class Sweep:
         t0 = time.time()
         for stage in (self.stage_compile, self.stage_correct, self.stage_quick, self.stage_full):
             stage()
-        ranked = sorted(self.cands, key=lambda c: (c.full is not None, c.full or 0, c.quick or 0), reverse=True)
-        winner = next((c for c in ranked if c.vs_best and c.vs_best - 1 > self.noise), None) if self.best else \
-            next((c for c in ranked if c.full), None)
+        ranked = sorted(self.cands, key=lambda c: (not c.dropped, c.full is not None, c.full or 0, c.quick or 0),
+                        reverse=True)
+        eligible = [c for c in ranked if not c.dropped]
+        winner = next((c for c in eligible if c.vs_best and c.vs_best - 1 > self.noise), None) if self.best else \
+            next((c for c in eligible if c.full), None)
         return {
             "sweep": self.id, "track": self.track.name, "wall_s": round(time.time() - t0, 1),
             "cost_usd": round(self.cost, 4), "noise": self.noise,

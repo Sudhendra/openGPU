@@ -17,6 +17,7 @@ from . import Machine, Provider
 
 class StaticHost(Provider):
     name = "ssh"
+    bills_uptime = False   # no uptime to report: spend is each job's time at cost_per_hr
 
     def _machine(self) -> Machine:
         o = self.opts
@@ -45,4 +46,5 @@ class StaticHost(Provider):
         pass
 
     def reaper_stop(self) -> dict:
-        return {"provider": self.name, "stop_cmd": self.opts.get("stop_cmd", "")}
+        # sessions: the host's boot is not when you started paying, so the reaper must not log one from it
+        return {"provider": self.name, "stop_cmd": self.opts.get("stop_cmd", ""), "sessions": False}

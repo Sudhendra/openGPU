@@ -189,6 +189,17 @@ def start_serverless(pcfg: Config, jid: str, track: Path, extra: list[Path], cmd
             "rate": modal_backend.rate(gpu, *modal_backend.container(pcfg))}
 
 
+def cancelled_serverless_cost(row, now: float | None = None) -> float:
+    """What a cancelled serverless job has already billed: its containers ran from about submission until now (the
+    same conservative estimate the budget uses while it is in flight)."""
+    try:
+        rate = json.loads(row["handle"])["rate"]
+    except (TypeError, ValueError, KeyError):
+        return 0.0
+    now = time.time() if now is None else now
+    return max(0.0, now - (row["submitted"] or now)) / 3600 * rate
+
+
 def hang_policy(cfg: Config, db, track: str, cmd: str, pool: str) -> dict:
     """What 'hung' means for this job, from how long the same command took before (watchdog on the pod)."""
     usual, n = ledger.usual_runtime(db, track, cmd, pool)

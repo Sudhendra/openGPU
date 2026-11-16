@@ -205,7 +205,8 @@ def tick(now):
         if limit > 0 and now - since >= limit:
             with open(STATE, "w") as f:
                 json.dump(state | {"stopping": True, "checked": now, "pid": os.getpid()}, f)
-            log_session_end()
+            if load_cfg().get("sessions", True):
+                log_session_end()
             stop_pod()
             return 120
     with open(STATE, "w") as f:  # `checked` doubles as the heartbeat `ogpu` checks before every job

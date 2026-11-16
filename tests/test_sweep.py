@@ -84,3 +84,30 @@ def test_no_winner_when_inside_noise(monkeypatch, tmp_path):
                       bench="b", compile_tpl=None, check_flag="--check", correct_args="", quick_args="", full_args="",
                       top_k=2, noise=0.015, note="", timeout_s=None).run()
     assert rep["recommend"] is None and "no candidate beat" in rep["verdict"]
+
+
+def test_candidate_failing_the_timing_pool_recheck_is_never_recommended(monkeypatch, tmp_path):
+    """A borderline pass on the cheap pool is rechecked in the full timing job; failing there drops it even if it
+    timed fastest."""
+    logs = {"correctness": "CHECK c a.py t: PASS relative L2 error 9e-3 [bound 1e-2]\n"
+                           "CHECK c b.py t: PASS relative L2 error 1e-3 [bound 1e-2]\n",
+            "full": "SCORE best.py: 1.00\nSCORE a.py: 1.50\nSCORE b.py: 1.05\n"
+                    "CHECK c a.py t: FAIL relative L2 error 2e-2 [bound 1e-2]\n"}
+    calls = []
+
+    def fake_job(self, cmd, *, mode="gpu", fidelity="timing", stage):
+        calls.append((stage, cmd))
+        p = tmp_path / f"{stage}.log"
+        p.write_text(logs[stage])
+        return {"id": stage, "status": "done", "log_path": str(p), "cost_usd": 0.0,
+                "pool": "correctness" if fidelity == "correctness" else "timing"}
+
+    monkeypatch.setattr(sweep.Sweep, "job", fake_job)
+    rep = sweep.Sweep(config.Config(), Console(quiet=True), track=Path("."), extra=[], cands=["a.py", "b.py"],
+                      best="best.py", bench="b", compile_tpl=None, check_flag="--check", correct_args="",
+                      quick_args="", full_args="", top_k=2, noise=0.015, note="", timeout_s=None).run()
+    assert "--check" in calls[-1][1]  # a.py was near the bound, so the full job rechecked it
+    by = {c["token"]: c for c in rep["candidates"]}
+    assert by["a.py"]["dropped"].startswith("correctness: FAIL on recheck")
+    assert by["a.py"]["full"] is None and by["a.py"]["vs_best"] is None
+    assert rep["recommend"] == "b.py" and rep["candidates"][0]["token"] == "b.py"

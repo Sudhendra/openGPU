@@ -47,6 +47,7 @@ class Provider:
     env_key = ""                   # environment variable holding the API key, if any
     default_gpus: list[str] = []   # used when the config's gpu_type_ids is empty
     default_tiers: list[str] = [""]
+    bills_uptime = True            # paid time = the machine's uptime sessions; False: each job's cost_usd counts
 
     def __init__(self, opts: dict | None = None):
         self.opts = opts or {}

@@ -213,6 +213,8 @@ def gpu_health(st: State, cfg: Config) -> tuple[bool, str]:
 
 def import_pod_sessions(st: State, cfg: Config) -> None:
     """Pull session-end records the reaper wrote before stopping (the idle tail the API can't report)."""
+    if not client(cfg, st).bills_uptime:  # billed per job: a session would count its time twice
+        return
     try:
         out = ssh.run(st, cfg.private_key_path, f"cat {REMOTE_OGPU}/sessions.jsonl 2>/dev/null && "
                       f"mv {REMOTE_OGPU}/sessions.jsonl {REMOTE_OGPU}/sessions.imported.$(date +%s)", check=False).stdout

@@ -37,7 +37,7 @@ def test_static_ssh_host_provider():
                                                                "cost_per_hr": 0.4, "stop_cmd": "true"}}))
     m = p.create(config.Config(), "", "")
     assert (m.ssh_host, m.ssh_port, m.ssh_user, m.status, m.cost_per_hr) == ("10.0.0.5", 2200, "me", "RUNNING", 0.4)
-    assert p.reaper_stop() == {"provider": "ssh", "stop_cmd": "true"}
+    assert p.reaper_stop() == {"provider": "ssh", "stop_cmd": "true", "sessions": False}
 
 
 def test_config_is_generic_by_default_and_okc_is_a_profile(tmp_path, monkeypatch):
@@ -233,3 +233,49 @@ def test_modal_container_is_small_and_priced_in_full():
     assert modal.rate("T4", 2, 8) == pytest.approx(0.59 + 2 * 0.04716 + 8 * 0.007992, rel=1e-3)
     big = config.Config(providers={"modal": {"cpu": 8, "memory_gb": 32}})
     assert modal.rate("T4", *modal.container(big)) > 1.2  # CPU + memory can cost more than a small GPU
+
+
+def test_ssh_host_spend_is_per_job_not_since_boot(tmp_path, monkeypatch):
+    db = ledger.connect(tmp_path / "l.db")
+    ledger.record(db, id="s", key=None, agent="a", track="t", cmd="c", mode="gpu", backend="ssh", status="done",
+                  exit_code=0, started=time.time() - 3600, ended=time.time(), wall_s=3600, cost_usd=2.0,
+                  metrics={}, log_path="x", cached_from=None)
+    assert ledger.spend(db) == pytest.approx(2.0)  # an ssh host reports no uptime: its jobs are the spend
+    # nor may a session the reaper logged from the host's boot be imported on top of them
+    from ogpu import pod
+    ran = []
+    monkeypatch.setattr(ssh, "run", lambda *a, **k: ran.append(a))
+    cfg = config.Config(provider="ssh", providers={"ssh": {"host": "h"}})
+    pod.import_pod_sessions(config.State(pod_id="h:22", provider="ssh"), cfg)
+    assert ran == []
+
+
+def test_reaper_logs_no_session_when_the_provider_bills_per_job(tmp_path, monkeypatch):
+    rp = load("reaper_sessions", REMOTE / "reaper.py")
+    monkeypatch.setattr(rp, "STATE", str(tmp_path / "reaper.json"))
+    monkeypatch.setattr(rp, "busy", lambda: False)
+    monkeypatch.setattr(rp, "watchdog", lambda *a: None)
+    monkeypatch.setattr(rp, "gpu_sample", lambda: None)
+    monkeypatch.setattr(rp, "idle_minutes", lambda: 1.0)
+    monkeypatch.setattr(rp, "last_activity", lambda: 0.0)
+    monkeypatch.setattr(rp, "stop_pod", lambda: None)
+    logged = []
+    monkeypatch.setattr(rp, "log_session_end", lambda: logged.append(1))
+    monkeypatch.setattr(rp, "load_cfg", lambda: {"provider": "ssh", "sessions": False})
+    assert rp.tick(1000.0) == 120 and logged == []
+    monkeypatch.setattr(rp, "load_cfg", lambda: {"provider": "runpod"})
+    rp.tick(1000.0)
+    assert logged == [1]
+
+
+def test_cancelled_serverless_job_keeps_what_it_billed(tmp_path):
+    db = ledger.connect(tmp_path / "l.db")
+    now = time.time()
+    ledger.record(db, id="m", key=None, agent="a", track="t", cmd="c", mode="gpu", backend="modal", status="running",
+                  exit_code=None, started=None, ended=None, wall_s=None, cost_usd=None, metrics={}, log_path="x",
+                  cached_from=None, submitted=now - 1800, handle=json.dumps({"pid": 1, "rate": 4.0}))
+    row = ledger.get(db, "m")
+    assert runner.cancelled_serverless_cost(row, now) == pytest.approx(2.0)
+    ledger.update(db, "m", status="cancelled", ended=now, cost_usd=runner.cancelled_serverless_cost(row, now))
+    assert ledger.spend(db) == pytest.approx(2.0)  # cancelled, but the half hour it ran still counts
+    assert runner.cancelled_serverless_cost({"handle": None, "submitted": now}) == 0.0

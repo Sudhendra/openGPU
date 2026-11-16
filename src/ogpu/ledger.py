@@ -118,6 +118,9 @@ def headline(metrics: dict) -> str:
 
 
 TERMINAL = ("done", "failed", "lost", "cancelled", "missing")
+# backends with no uptime sessions to bill from: serverless (modal) and hosts you already have (ssh, whose provider
+# reports no uptime). Their spend is the sum of their jobs' cost_usd.
+PER_JOB_BACKENDS = ("modal", "ssh")
 IN_FLIGHT_S = 3 * 3600
 
 
@@ -199,10 +202,11 @@ def record_session(db: sqlite3.Connection, pod_id: str, uptime_s: float, cost_pe
 
 
 def spend(db: sqlite3.Connection, since: float = 0.0) -> float:
-    """$ spent in machine sessions that ended after `since` (clipped to `since`), plus serverless jobs (billed per
-    job, no machine session)."""
-    total = db.execute("select coalesce(sum(cost_usd), 0) c from runs where backend = 'modal' and ended > ?",
-                       (since,)).fetchone()["c"]
+    """$ spent in machine sessions that ended after `since` (clipped to `since`), plus jobs on backends that have no
+    machine sessions (PER_JOB_BACKENDS: billed per job)."""
+    marks = ",".join("?" * len(PER_JOB_BACKENDS))
+    total = db.execute(f"select coalesce(sum(cost_usd), 0) c from runs where backend in ({marks}) and ended > ?",
+                       (*PER_JOB_BACKENDS, since)).fetchone()["c"]
     now = time.time()
     # serverless jobs still in flight bill as they go: count them from submission (conservative: includes start-up)
     for r in db.execute("select submitted, handle from runs where backend = 'modal' and status in ('queued','running')"):
